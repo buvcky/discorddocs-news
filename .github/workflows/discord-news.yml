@@ -65,10 +65,9 @@ jobs:
                 title: "Discord Developer Docs Updated",
                 description: $message,
                 url: $url,
-                color: 5793266,
                 fields: [{
                   name: "Official Source",
-                  value: "[discord/discord-api-docs](https://github.com/discord/discord-api-docs)"
+                  value: "[Discord Developer Docs](https://github.com/discord/discord-api-docs)"
                 }],
                 footer: {
                   text: "Official Discord Developer Documentation"
@@ -77,7 +76,19 @@ jobs:
               }]
             }')
 
-          curl -fsSL \
+          response=$(curl -sS \
+            -w "\nHTTP_STATUS:%{http_code}" \
             -H "Content-Type: application/json" \
             -d "$payload" \
-            "$DISCORD_WEBHOOK"
+            "$DISCORD_WEBHOOK")
+
+          echo "$response"
+
+          status=$(echo "$response" | tail -n 1 | sed 's/HTTP_STATUS://')
+
+          if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
+            echo "Discord Webhook returned HTTP $status"
+            exit 1
+          fi
+
+          echo "Discord notification sent successfully."
