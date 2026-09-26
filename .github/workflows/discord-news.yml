@@ -15,14 +15,16 @@ jobs:
     steps:
       - name: Get latest Discord Docs commit
         id: commit
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
 
-          response=$(curl -fsSL \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2026-03-10" \
-            "https://api.github.com/repos/discord/discord-api-docs/commits?per_page=1")
+          response=$(gh api \
+            repos/discord/discord-api-docs/commits \
+            --method GET \
+            -f per_page=1)
 
           sha=$(echo "$response" | jq -r '.[0].sha')
           message=$(echo "$response" | jq -r '.[0].commit.message' | head -n 1)
@@ -39,17 +41,15 @@ jobs:
       - name: Get changed files
         id: files
         env:
+          GH_TOKEN: ${{ github.token }}
           SHA: ${{ steps.commit.outputs.sha }}
         shell: bash
         run: |
           set -euo pipefail
 
-          response=$(curl -fsSL \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2026-03-10" \
-            "https://api.github.com/repos/discord/discord-api-docs/commits/$SHA")
-
-          echo "$response" | jq -r '.files[].filename' > changed-files.txt
+          gh api \
+            "repos/discord/discord-api-docs/commits/$SHA" \
+            | jq -r '.files[].filename' > changed-files.txt
 
           echo "Changed files:"
           cat changed-files.txt
@@ -78,21 +78,22 @@ jobs:
             category="breaking"
 
           elif echo "$files" | grep -Eiq \
-            'developers/discord-social-sdk/|developers/guides/social-sdk'; then
+            '^resources/discord-social-sdk/|^developers/discord-social-sdk/'; then
             category="social_sdk"
 
           elif echo "$files" | grep -Eiq \
-            'developers/change-log\.mdx'; then
+            '^developers/change-log\.mdx$'; then
             category="changelog"
 
           elif echo "$files" | grep -Eiq \
-            'developers/reference/|developers/resources/|developers/events/|developers/topics/|developers/components/'; then
+            '^developers/reference|^developers/resources/|^developers/events/|^developers/topics/|^developers/components/'; then
             category="api"
 
           else
             category="docs"
           fi
 
+          echo "Detected category: $category"
           echo "category=$category" >> "$GITHUB_OUTPUT"
 
       - name: Send Discord embed
@@ -101,8 +102,6 @@ jobs:
           CATEGORY: ${{ steps.classify.outputs.category }}
 
           WEBHOOK_CHANGELOG: ${{ secrets.WEBHOOK_CHANGELOG }}
-          WEBHOOK_PATCH_NOTES: ${{ secrets.WEBHOOK_PATCH_NOTES }}
-          WEBHOOK_DEVELOPER_NEWS: ${{ secrets.WEBHOOK_DEVELOPER_NEWS }}
           WEBHOOK_API: ${{ secrets.WEBHOOK_API }}
           WEBHOOK_DOCS: ${{ secrets.WEBHOOK_DOCS }}
           WEBHOOK_SOCIAL_SDK: ${{ secrets.WEBHOOK_SOCIAL_SDK }}
@@ -113,6 +112,7 @@ jobs:
           AUTHOR: ${{ steps.commit.outputs.author }}
           DATE: ${{ steps.commit.outputs.date }}
           SHA: ${{ steps.commit.outputs.sha }}
+
         shell: bash
         run: |
           set -euo pipefail
@@ -150,7 +150,7 @@ jobs:
           esac
 
           if [ -z "$WEBHOOK" ]; then
-            echo "Webhook is missing for category: $CATEGORY"
+            echo "Missing webhook for category: $CATEGORY"
             exit 1
           fi
 
@@ -168,7 +168,7 @@ jobs:
               embeds: [{
                 author: {
                   name: "Discord Developer Documentation",
-                  url: "https://discord.com/developers/docs"
+                  url: "https://docs.discord.com/developers"
                 },
                 title: $message,
                 url: $url,
@@ -198,7 +198,7 @@ jobs:
               }]
             }')
 
-          echo "Sending $CATEGORY_NAME notification..."
+          echo "Sending Discord notification..."
 
           response=$(curl -sS \
             -w "\nHTTP_STATUS:%{http_code}" \
