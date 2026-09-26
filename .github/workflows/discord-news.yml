@@ -1,4 +1,4 @@
-name: Discord Docs News
+name: Discord Official News
 
 on:
   schedule:
@@ -13,18 +13,21 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+
+      # =========================================================
+      # 1. Get latest Discord Developer Docs commit
+      # =========================================================
+
       - name: Get latest Discord Docs commit
-        id: commit
-        env:
-          GH_TOKEN: ${{ github.token }}
+        id: github_commit
         shell: bash
         run: |
           set -euo pipefail
 
-          response=$(gh api \
-            repos/discord/discord-api-docs/commits \
-            --method GET \
-            -f per_page=1)
+          response=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "https://api.github.com/repos/discord/discord-api-docs/commits?per_page=1")
 
           sha=$(echo "$response" | jq -r '.[0].sha')
           message=$(echo "$response" | jq -r '.[0].commit.message' | head -n 1)
@@ -38,66 +41,252 @@ jobs:
           echo "author=$author" >> "$GITHUB_OUTPUT"
           echo "date=$date" >> "$GITHUB_OUTPUT"
 
+      # =========================================================
+      # 2. Get changed files
+      # =========================================================
+
       - name: Get changed files
-        id: files
+        id: changed_files
         env:
-          GH_TOKEN: ${{ github.token }}
-          SHA: ${{ steps.commit.outputs.sha }}
+          SHA: ${{ steps.github_commit.outputs.sha }}
         shell: bash
         run: |
           set -euo pipefail
 
-          gh api \
-            "repos/discord/discord-api-docs/commits/$SHA" \
+          curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "https://api.github.com/repos/discord/discord-api-docs/commits/$SHA" \
             | jq -r '.files[].filename' > changed-files.txt
 
           echo "Changed files:"
           cat changed-files.txt
 
-      - name: Check if already announced
-        id: cache
-        uses: actions/cache@v4
-        with:
-          path: .discorddocs
-          key: discord-docs-${{ steps.commit.outputs.sha }}
+      # =========================================================
+      # 3. Detect official Discord website updates
+      # =========================================================
 
-      - name: Classify update
-        id: classify
-        if: steps.cache.outputs.cache-hit != 'true'
+      - name: Detect official Discord website updates
+        id: web_sources
         shell: bash
         run: |
           set -euo pipefail
 
-          message="${{ steps.commit.outputs.message }}"
-          files="$(cat changed-files.txt)"
+          python3 <<'PY'
+          import urllib.request
+          import re
+          import html
+          import json
 
-          category="docs"
+          headers = {
+              "User-Agent": "Mozilla/5.0 DiscordDocsNews/1.0"
+          }
 
-          if echo "$message $files" | grep -Eiq \
+          def fetch(url):
+              req = urllib.request.Request(url, headers=headers)
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  return r.read().decode("utf-8", errors="ignore")
+
+          def clean(text):
+              text = html.unescape(text)
+              text = re.sub(r"<[^>]+>", " ", text)
+              text = re.sub(r"\s+", " ", text)
+              return text.strip()
+
+          def find_links(page, pattern):
+              results = []
+
+              regex = re.compile(
+                  r'href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+                  re.I | re.S
+              )
+
+              for href, text in regex.findall(page):
+                  text = clean(text)
+
+                  if re.search(pattern, href, re.I) or re.search(pattern, text, re.I):
+                      if href.startswith("/"):
+                          href = "https://discord.com" + href
+
+                      if href.startswith("https://discord.com/"):
+                          results.append({
+                              "url": href,
+                              "title": text
+                          })
+
+              unique = []
+              seen = set()
+
+              for item in results:
+                  if item["url"] not in seen:
+                      seen.add(item["url"])
+                      unique.append(item)
+
+              return unique
+
+          blog = fetch("https://discord.com/blog")
+
+          patch = find_links(
+              blog,
+              r"patch-notes"
+          )
+
+          changelog = find_links(
+              blog,
+              r"changelog"
+          )
+
+          newsletter_page = fetch(
+              "https://discord.com/developers/developer-newsletter"
+          )
+
+          newsletter = find_links(
+              newsletter_page,
+              r"developer-newsletter/"
+          )
+
+          data = {
+              "patch": patch[0] if patch else {},
+              "changelog": changelog[0] if changelog else {},
+              "newsletter": newsletter[0] if newsletter else {}
+          }
+
+          print(json.dumps(data))
+
+          with open("web-sources.json", "w", encoding="utf-8") as f:
+              json.dump(data, f)
+          PY
+
+          echo "Detected official web sources:"
+          cat web-sources.json
+
+      # =========================================================
+      # 4. Read website data
+      # =========================================================
+
+      - name: Read website data
+        id: web_data
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import json
+          import os
+
+          with open("web-sources.json", encoding="utf-8") as f:
+              data = json.load(f)
+
+          for name in ["patch", "changelog", "newsletter"]:
+              item = data.get(name, {})
+
+              url = item.get("url", "")
+              title = item.get("title", "")
+
+              print(f"{name}: {title}")
+              print(f"{name}: {url}")
+
+              with open(f"{name}.env", "w", encoding="utf-8") as out:
+                  out.write(f"URL={url}\n")
+                  out.write(f"TITLE={title}\n")
+          PY
+
+      # =========================================================
+      # 5. Cache GitHub commit
+      # =========================================================
+
+      - name: Cache GitHub commit
+        id: cache_github
+        uses: actions/cache@v6
+        with:
+          path: .state/github
+          key: discord-github-${{ steps.github_commit.outputs.sha }}
+
+      # =========================================================
+      # 6. Cache Patch Notes
+      # =========================================================
+
+      - name: Cache Patch Notes
+        id: cache_patch
+        uses: actions/cache@v6
+        with:
+          path: .state/patch
+          key: discord-patch-${{ hashFiles('patch.env') }}
+
+      # =========================================================
+      # 7. Cache Changelog
+      # =========================================================
+
+      - name: Cache Changelog
+        id: cache_changelog
+        uses: actions/cache@v6
+        with:
+          path: .state/changelog
+          key: discord-changelog-${{ hashFiles('changelog.env') }}
+
+      # =========================================================
+      # 8. Cache Developer Newsletter
+      # =========================================================
+
+      - name: Cache Developer Newsletter
+        id: cache_newsletter
+        uses: actions/cache@v6
+        with:
+          path: .state/newsletter
+          key: discord-newsletter-${{ hashFiles('newsletter.env') }}
+
+      # =========================================================
+      # 9. Classify GitHub update
+      # =========================================================
+
+      - name: Classify GitHub update
+        id: classify
+        if: steps.cache_github.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MESSAGE="${{ steps.github_commit.outputs.message }}"
+          FILES="$(cat changed-files.txt)"
+
+          CATEGORY="docs"
+
+          if echo "$MESSAGE $FILES" | grep -Eiq \
             'breaking|deprecated|deprecat|removed|removal|breaking change'; then
-            category="breaking"
 
-          elif echo "$files" | grep -Eiq \
+            CATEGORY="breaking"
+
+          elif echo "$FILES" | grep -Eiq \
             '^resources/discord-social-sdk/|^developers/discord-social-sdk/'; then
-            category="social_sdk"
 
-          elif echo "$files" | grep -Eiq \
+            CATEGORY="social_sdk"
+
+          elif echo "$FILES" | grep -Eiq \
             '^developers/change-log\.mdx$'; then
-            category="changelog"
 
-          elif echo "$files" | grep -Eiq \
-            '^developers/reference|^developers/resources/|^developers/events/|^developers/topics/|^developers/components/'; then
-            category="api"
+            CATEGORY="changelog"
+
+          elif echo "$FILES" | grep -Eiq \
+            '^developers/reference\.mdx$|^developers/reference/|^developers/resources/|^developers/events/|^developers/topics/|^developers/components/'; then
+
+            CATEGORY="api"
 
           else
-            category="docs"
+
+            CATEGORY="docs"
+
           fi
 
-          echo "Detected category: $category"
-          echo "category=$category" >> "$GITHUB_OUTPUT"
+          echo "category=$CATEGORY" >> "$GITHUB_OUTPUT"
 
-      - name: Send Discord embed
-        if: steps.cache.outputs.cache-hit != 'true'
+          echo "Detected category: $CATEGORY"
+
+      # =========================================================
+      # 10. Send GitHub update
+      # =========================================================
+
+      - name: Send GitHub update
+        if: steps.cache_github.outputs.cache-hit != 'true'
         env:
           CATEGORY: ${{ steps.classify.outputs.category }}
 
@@ -107,30 +296,31 @@ jobs:
           WEBHOOK_SOCIAL_SDK: ${{ secrets.WEBHOOK_SOCIAL_SDK }}
           WEBHOOK_BREAKING: ${{ secrets.WEBHOOK_BREAKING }}
 
-          MESSAGE: ${{ steps.commit.outputs.message }}
-          URL: ${{ steps.commit.outputs.url }}
-          AUTHOR: ${{ steps.commit.outputs.author }}
-          DATE: ${{ steps.commit.outputs.date }}
-          SHA: ${{ steps.commit.outputs.sha }}
+          MESSAGE: ${{ steps.github_commit.outputs.message }}
+          URL: ${{ steps.github_commit.outputs.url }}
+          AUTHOR: ${{ steps.github_commit.outputs.author }}
+          DATE: ${{ steps.github_commit.outputs.date }}
+          SHA: ${{ steps.github_commit.outputs.sha }}
 
         shell: bash
         run: |
           set -euo pipefail
 
           case "$CATEGORY" in
+
             changelog)
               WEBHOOK="$WEBHOOK_CHANGELOG"
-              CATEGORY_NAME="Discord Changelog"
+              CATEGORY_NAME="Developer Changelog"
               ;;
 
             api)
               WEBHOOK="$WEBHOOK_API"
-              CATEGORY_NAME="Discord API Update"
+              CATEGORY_NAME="API Update"
               ;;
 
             social_sdk)
               WEBHOOK="$WEBHOOK_SOCIAL_SDK"
-              CATEGORY_NAME="Discord Social SDK"
+              CATEGORY_NAME="Social SDK"
               ;;
 
             breaking)
@@ -140,19 +330,15 @@ jobs:
 
             docs)
               WEBHOOK="$WEBHOOK_DOCS"
-              CATEGORY_NAME="Discord Documentation"
+              CATEGORY_NAME="Documentation"
               ;;
 
             *)
               WEBHOOK="$WEBHOOK_DOCS"
-              CATEGORY_NAME="Discord Documentation"
+              CATEGORY_NAME="Documentation"
               ;;
-          esac
 
-          if [ -z "$WEBHOOK" ]; then
-            echo "Missing webhook for category: $CATEGORY"
-            exit 1
-          fi
+          esac
 
           short_sha="${SHA:0:7}"
 
@@ -167,8 +353,7 @@ jobs:
               username: "Docs Updates",
               embeds: [{
                 author: {
-                  name: "Discord Developer Documentation",
-                  url: "https://docs.discord.com/developers"
+                  name: "Discord Developer Documentation"
                 },
                 title: $message,
                 url: $url,
@@ -198,7 +383,62 @@ jobs:
               }]
             }')
 
-          echo "Sending Discord notification..."
+          response=$(curl -sS \
+            -w "\nHTTP_STATUS:%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "$WEBHOOK")
+
+          echo "$response"
+
+          status=$(echo "$response" | tail -n 1 | sed 's/HTTP_STATUS://')
+
+          if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
+            echo "Discord returned HTTP $status"
+            exit 1
+          fi
+
+          mkdir -p .state/github
+          echo "$SHA" > .state/github/latest
+
+      # =========================================================
+      # 11. Send official Discord Changelog
+      # =========================================================
+
+      - name: Send official Discord Changelog
+        if: steps.cache_changelog.outputs.cache-hit != 'true'
+        env:
+          WEBHOOK: ${{ secrets.WEBHOOK_CHANGELOG }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          source changelog.env
+
+          if [ -z "$URL" ]; then
+            echo "No changelog found."
+            exit 0
+          fi
+
+          payload=$(jq -n \
+            --arg title "$TITLE" \
+            --arg url "$URL" \
+            '{
+              username: "Changelog Updates",
+              embeds: [{
+                author: {
+                  name: "Discord Changelog"
+                },
+                title: $title,
+                url: $url,
+                description: "Official Discord product changelog.",
+                color: 5793266,
+                footer: {
+                  text: "Official Discord Blog"
+                }
+              }]
+            }')
 
           response=$(curl -sS \
             -w "\nHTTP_STATUS:%{http_code}" \
@@ -216,11 +456,119 @@ jobs:
             exit 1
           fi
 
-          echo "Notification sent successfully."
+          mkdir -p .state/changelog
+          echo "$URL" > .state/changelog/latest
 
-      - name: Save announced commit
-        if: steps.cache.outputs.cache-hit != 'true'
+      # =========================================================
+      # 12. Send Patch Notes
+      # =========================================================
+
+      - name: Send official Patch Notes
+        if: steps.cache_patch.outputs.cache-hit != 'true'
+        env:
+          WEBHOOK: ${{ secrets.WEBHOOK_PATCH_NOTES }}
         shell: bash
         run: |
-          mkdir -p .discorddocs
-          echo "${{ steps.commit.outputs.sha }}" > .discorddocs/latest
+          set -euo pipefail
+
+          source patch.env
+
+          if [ -z "$URL" ]; then
+            echo "No patch notes found."
+            exit 0
+          fi
+
+          payload=$(jq -n \
+            --arg title "$TITLE" \
+            --arg url "$URL" \
+            '{
+              username: "Patch Notes",
+              embeds: [{
+                author: {
+                  name: "Discord Patch Notes"
+                },
+                title: $title,
+                url: $url,
+                description: "Official Discord Patch Notes.",
+                color: 5793266,
+                footer: {
+                  text: "Official Discord Blog"
+                }
+              }]
+            }')
+
+          response=$(curl -sS \
+            -w "\nHTTP_STATUS:%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "$WEBHOOK")
+
+          echo "$response"
+
+          status=$(echo "$response" | tail -n 1 | sed 's/HTTP_STATUS://')
+
+          if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
+            echo "Discord returned HTTP $status"
+            exit 1
+          fi
+
+          mkdir -p .state/patch
+          echo "$URL" > .state/patch/latest
+
+      # =========================================================
+      # 13. Send Developer Newsletter
+      # =========================================================
+
+      - name: Send Developer Newsletter
+        if: steps.cache_newsletter.outputs.cache-hit != 'true'
+        env:
+          WEBHOOK: ${{ secrets.WEBHOOK_DEVELOPER_NEWS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          source newsletter.env
+
+          if [ -z "$URL" ]; then
+            echo "No developer newsletter found."
+            exit 0
+          fi
+
+          payload=$(jq -n \
+            --arg title "$TITLE" \
+            --arg url "$URL" \
+            '{
+              username: "Developer News",
+              embeds: [{
+                author: {
+                  name: "Discord Developer Newsletter"
+                },
+                title: $title,
+                url: $url,
+                description: "Official Discord developer newsletter.",
+                color: 5793266,
+                footer: {
+                  text: "Official Discord Developer Newsletter"
+                }
+              }]
+            }')
+
+          response=$(curl -sS \
+            -w "\nHTTP_STATUS:%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "$WEBHOOK")
+
+          echo "$response"
+
+          status=$(echo "$response" | tail -n 1 | sed 's/HTTP_STATUS://')
+
+          if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
+            echo "Discord returned HTTP $status"
+            exit 1
+          fi
+
+          mkdir -p .state/newsletter
+          echo "$URL" > .state/newsletter/latest
