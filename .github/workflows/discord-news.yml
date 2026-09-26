@@ -1,0 +1,83 @@
+name: Discord Docs News
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-discord:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Get latest Discord Docs commit
+        id: discord
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          response=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "https://api.github.com/repos/discord/discord-api-docs/commits?per_page=1")
+
+          sha=$(echo "$response" | jq -r '.[0].sha')
+          message=$(echo "$response" | jq -r '.[0].commit.message' | head -n 1)
+          url=$(echo "$response" | jq -r '.[0].html_url')
+          date=$(echo "$response" | jq -r '.[0].commit.author.date')
+
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "message=$message" >> "$GITHUB_OUTPUT"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "date=$date" >> "$GITHUB_OUTPUT"
+
+      - name: Check if already announced
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: .discorddocs
+          key: discord-docs-${{ steps.discord.outputs.sha }}
+
+      - name: Send Discord notification
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          MESSAGE: ${{ steps.discord.outputs.message }}
+          URL: ${{ steps.discord.outputs.url }}
+          DATE: ${{ steps.discord.outputs.date }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p .discorddocs
+          echo "${{ steps.discord.outputs.sha }}" > .discorddocs/latest
+
+          payload=$(jq -n \
+            --arg message "$MESSAGE" \
+            --arg url "$URL" \
+            --arg date "$DATE" \
+            '{
+              username: "DiscordDocs News",
+              embeds: [{
+                title: "Discord Developer Docs Updated",
+                description: $message,
+                url: $url,
+                color: 5793266,
+                fields: [{
+                  name: "Official Source",
+                  value: "[discord/discord-api-docs](https://github.com/discord/discord-api-docs)"
+                }],
+                footer: {
+                  text: "Official Discord Developer Documentation"
+                },
+                timestamp: $date
+              }]
+            }')
+
+          curl -fsSL \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "$DISCORD_WEBHOOK"
