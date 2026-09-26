@@ -164,7 +164,7 @@ jobs:
             --arg sha "$short_sha" \
             --arg date "$DATE" \
             '{
-              username: "DiscordDocs",
+              username: "Docs Updates",
               embeds: [{
                 author: {
                   name: "Discord Developer Documentation",
