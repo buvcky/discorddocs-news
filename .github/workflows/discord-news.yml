@@ -34,61 +34,28 @@ jobs:
           echo "url=$url" >> "$GITHUB_OUTPUT"
           echo "date=$date" >> "$GITHUB_OUTPUT"
 
-      - name: Check if already announced
-        id: cache
-        uses: actions/cache@v4
-        with:
-          path: .discorddocs
-          key: discord-docs-${{ steps.discord.outputs.sha }}
-
       - name: Send Discord notification
-        if: steps.cache.outputs.cache-hit != 'true'
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           MESSAGE: ${{ steps.discord.outputs.message }}
           URL: ${{ steps.discord.outputs.url }}
-          DATE: ${{ steps.discord.outputs.date }}
         shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p .discorddocs
-          echo "${{ steps.discord.outputs.sha }}" > .discorddocs/latest
-
           payload=$(jq -n \
             --arg message "$MESSAGE" \
             --arg url "$URL" \
-            --arg date "$DATE" \
             '{
-              username: "DiscordDocs News",
-              embeds: [{
-                title: "Discord Developer Docs Updated",
-                description: $message,
-                url: $url,
-                fields: [{
-                  name: "Official Source",
-                  value: "[Discord Developer Docs](https://github.com/discord/discord-api-docs)"
-                }],
-                footer: {
-                  text: "Official Discord Developer Documentation"
-                },
-                timestamp: $date
-              }]
+              content: "📢 **Discord Developer Docs Updated**\n\n\($message)\n\n🔗 \($url)"
             }')
 
-          response=$(curl -sS \
-            -w "\nHTTP_STATUS:%{http_code}" \
+          echo "Sending notification to Discord..."
+
+          curl -sS \
+            -X POST \
             -H "Content-Type: application/json" \
             -d "$payload" \
-            "$DISCORD_WEBHOOK")
-
-          echo "$response"
-
-          status=$(echo "$response" | tail -n 1 | sed 's/HTTP_STATUS://')
-
-          if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
-            echo "Discord Webhook returned HTTP $status"
-            exit 1
-          fi
+            "$DISCORD_WEBHOOK"
 
           echo "Discord notification sent successfully."
