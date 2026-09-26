@@ -14,7 +14,7 @@ jobs:
 
     steps:
       - name: Get latest Discord Docs commit
-        id: discord
+        id: commit
         shell: bash
         run: |
           set -euo pipefail
@@ -27,35 +27,200 @@ jobs:
           sha=$(echo "$response" | jq -r '.[0].sha')
           message=$(echo "$response" | jq -r '.[0].commit.message' | head -n 1)
           url=$(echo "$response" | jq -r '.[0].html_url')
+          author=$(echo "$response" | jq -r '.[0].commit.author.name')
           date=$(echo "$response" | jq -r '.[0].commit.author.date')
 
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "message=$message" >> "$GITHUB_OUTPUT"
           echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "author=$author" >> "$GITHUB_OUTPUT"
           echo "date=$date" >> "$GITHUB_OUTPUT"
 
-      - name: Send Discord notification
+      - name: Get changed files
+        id: files
         env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          MESSAGE: ${{ steps.discord.outputs.message }}
-          URL: ${{ steps.discord.outputs.url }}
+          SHA: ${{ steps.commit.outputs.sha }}
         shell: bash
         run: |
           set -euo pipefail
 
+          response=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "https://api.github.com/repos/discord/discord-api-docs/commits/$SHA")
+
+          echo "$response" | jq -r '.files[].filename' > changed-files.txt
+
+          echo "Changed files:"
+          cat changed-files.txt
+
+      - name: Check if already announced
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: .discorddocs
+          key: discord-docs-${{ steps.commit.outputs.sha }}
+
+      - name: Classify update
+        id: classify
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          message="${{ steps.commit.outputs.message }}"
+          files="$(cat changed-files.txt)"
+
+          category="docs"
+
+          if echo "$message $files" | grep -Eiq \
+            'breaking|deprecated|deprecat|removed|removal|breaking change'; then
+            category="breaking"
+
+          elif echo "$files" | grep -Eiq \
+            'developers/discord-social-sdk/|developers/guides/social-sdk'; then
+            category="social_sdk"
+
+          elif echo "$files" | grep -Eiq \
+            'developers/change-log\.mdx'; then
+            category="changelog"
+
+          elif echo "$files" | grep -Eiq \
+            'developers/reference/|developers/resources/|developers/events/|developers/topics/|developers/components/'; then
+            category="api"
+
+          else
+            category="docs"
+          fi
+
+          echo "category=$category" >> "$GITHUB_OUTPUT"
+
+      - name: Send Discord embed
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          CATEGORY: ${{ steps.classify.outputs.category }}
+
+          WEBHOOK_CHANGELOG: ${{ secrets.WEBHOOK_CHANGELOG }}
+          WEBHOOK_PATCH_NOTES: ${{ secrets.WEBHOOK_PATCH_NOTES }}
+          WEBHOOK_DEVELOPER_NEWS: ${{ secrets.WEBHOOK_DEVELOPER_NEWS }}
+          WEBHOOK_API: ${{ secrets.WEBHOOK_API }}
+          WEBHOOK_DOCS: ${{ secrets.WEBHOOK_DOCS }}
+          WEBHOOK_SOCIAL_SDK: ${{ secrets.WEBHOOK_SOCIAL_SDK }}
+          WEBHOOK_BREAKING: ${{ secrets.WEBHOOK_BREAKING }}
+
+          MESSAGE: ${{ steps.commit.outputs.message }}
+          URL: ${{ steps.commit.outputs.url }}
+          AUTHOR: ${{ steps.commit.outputs.author }}
+          DATE: ${{ steps.commit.outputs.date }}
+          SHA: ${{ steps.commit.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "$CATEGORY" in
+            changelog)
+              WEBHOOK="$WEBHOOK_CHANGELOG"
+              CATEGORY_NAME="Discord Changelog"
+              ;;
+
+            api)
+              WEBHOOK="$WEBHOOK_API"
+              CATEGORY_NAME="Discord API Update"
+              ;;
+
+            social_sdk)
+              WEBHOOK="$WEBHOOK_SOCIAL_SDK"
+              CATEGORY_NAME="Discord Social SDK"
+              ;;
+
+            breaking)
+              WEBHOOK="$WEBHOOK_BREAKING"
+              CATEGORY_NAME="Breaking Change"
+              ;;
+
+            docs)
+              WEBHOOK="$WEBHOOK_DOCS"
+              CATEGORY_NAME="Discord Documentation"
+              ;;
+
+            *)
+              WEBHOOK="$WEBHOOK_DOCS"
+              CATEGORY_NAME="Discord Documentation"
+              ;;
+          esac
+
+          if [ -z "$WEBHOOK" ]; then
+            echo "Webhook is missing for category: $CATEGORY"
+            exit 1
+          fi
+
+          short_sha="${SHA:0:7}"
+
           payload=$(jq -n \
+            --arg category "$CATEGORY_NAME" \
             --arg message "$MESSAGE" \
             --arg url "$URL" \
+            --arg author "$AUTHOR" \
+            --arg sha "$short_sha" \
+            --arg date "$DATE" \
             '{
-              content: "📢 **Discord Developer Docs Updated**\n\n\($message)\n\n🔗 \($url)"
+              username: "DiscordDocs",
+              embeds: [{
+                author: {
+                  name: "Discord Developer Documentation",
+                  url: "https://discord.com/developers/docs"
+                },
+                title: $message,
+                url: $url,
+                description: "An official update was published to the Discord Developer Documentation.",
+                color: 5793266,
+                fields: [
+                  {
+                    name: "Category",
+                    value: $category,
+                    inline: true
+                  },
+                  {
+                    name: "Author",
+                    value: $author,
+                    inline: true
+                  },
+                  {
+                    name: "Commit",
+                    value: $sha,
+                    inline: true
+                  }
+                ],
+                footer: {
+                  text: "Discord Developer Documentation"
+                },
+                timestamp: $date
+              }]
             }')
 
-          echo "Sending notification to Discord..."
+          echo "Sending $CATEGORY_NAME notification..."
 
-          curl -sS \
+          response=$(curl -sS \
+            -w "\nHTTP_STATUS:%{http_code}" \
             -X POST \
             -H "Content-Type: application/json" \
             -d "$payload" \
-            "$DISCORD_WEBHOOK"
+            "$WEBHOOK")
 
-          echo "Discord notification sent successfully."
+          echo "$response"
+
+          status=$(echo "$response" | tail -n 1 | sed 's/HTTP_STATUS://')
+
+          if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
+            echo "Discord returned HTTP $status"
+            exit 1
+          fi
+
+          echo "Notification sent successfully."
+
+      - name: Save announced commit
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          mkdir -p .discorddocs
+          echo "${{ steps.commit.outputs.sha }}" > .discorddocs/latest
