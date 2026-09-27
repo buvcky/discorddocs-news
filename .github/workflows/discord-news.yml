@@ -5,12 +5,24 @@ on:
   schedule:
     - cron: "*/15 * * * *"
 
+concurrency:
+  group: discord-news
+  cancel-in-progress: false
+
 jobs:
   discord-news:
     runs-on: ubuntu-24.04
 
     steps:
-      - name: Fetch and send Discord updates
+      - name: Restore update state
+        uses: actions/cache@v6
+        with:
+          path: .discord-state
+          key: discord-news-state-${{ github.run_id }}
+          restore-keys: |
+            discord-news-state-
+
+      - name: Fetch sources and send updates
         env:
           WEBHOOK_API: ${{ secrets.WEBHOOK_API }}
           WEBHOOK_BREAKING: ${{ secrets.WEBHOOK_BREAKING }}
@@ -29,356 +41,665 @@ jobs:
           import hashlib
           import urllib.request
           import urllib.parse
-          from html import unescape
+          import urllib.error
           from pathlib import Path
-          from datetime import datetime
+          from html import unescape
+          from html.parser import HTMLParser
 
           STATE_DIR = Path(".discord-state")
-          STATE_DIR.mkdir(exist_ok=True)
+          STATE_DIR.mkdir(parents=True, exist_ok=True)
 
           HEADERS = {
-              "User-Agent": "Mozilla/5.0 (compatible; DiscordDocsNews/1.0)",
-              "Accept": "text/html,application/xhtml+xml",
+              "User-Agent": "Mozilla/5.0 (DiscordDocsNews/2.0)",
+              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
           }
+
+          CHANGELOG_RAW = (
+              "https://raw.githubusercontent.com/"
+              "discord/discord-api-docs/main/docs/change-log.mdx"
+          )
+
+          CHANGELOG_PAGE = "https://discord.com/developers/docs/change-log"
 
           SOURCES = {
               "patch_notes": {
                   "webhook": "WEBHOOK_PATCH_NOTES",
-                  "url": "https://discord.com/blog",
-                  "keywords": [
-                      "discord patch notes",
-                      "patch notes"
-                  ],
+                  "tag_url": "https://discord.com/tags/patch-notes",
+                  "match": lambda title: "patch notes" in title.lower(),
               },
-              "developer_news": {
-                  "webhook": "WEBHOOK_DEVELOPER_NEWS",
-                  "url": "https://discord.com/developers/developer-newsletter",
-                  "keywords": [
-                      "developer newsletter",
-                      "discord’s latest developer updates",
-                      "discord's latest developer updates"
-                  ],
-              },
+
               "changelog": {
                   "webhook": "WEBHOOK_CHANGELOG",
-                  "url": "https://discord.com/blog",
-                  "keywords": [
-                      "changelog"
-                  ],
+                  "tag_url": "https://discord.com/tags/changelog",
+                  "match": lambda title: "changelog" in title.lower(),
               },
-              "social_sdk": {
-                  "webhook": "WEBHOOK_SOCIAL_SDK",
-                  "url": "https://discord.com/developers/docs/social-sdk/release_notes.html",
-                  "keywords": [
-                      "release notes",
-                      "social sdk"
-                  ],
-              },
-              "api": {
-                  "webhook": "WEBHOOK_API",
-                  "url": "https://discord.com/developers/docs/change-log",
-                  "keywords": [
-                      "api"
-                  ],
-              },
-              "docs": {
-                  "webhook": "WEBHOOK_DOCS",
-                  "url": "https://discord.com/developers/docs",
-                  "keywords": [
-                      "documentation",
-                      "docs"
-                  ],
-              },
-              "breaking": {
-                  "webhook": "WEBHOOK_BREAKING",
-                  "url": "https://discord.com/blog",
-                  "keywords": [
-                      "breaking",
-                      "important",
-                      "security"
-                  ],
+
+              "developer_news": {
+                  "webhook": "WEBHOOK_DEVELOPER_NEWS",
+                  "tag_url": "https://discord.com/developers/developer-newsletter",
+                  "match": lambda title: True,
               },
           }
 
+
           def fetch(url):
-              req = urllib.request.Request(url, headers=HEADERS)
-              with urllib.request.urlopen(req, timeout=30) as r:
-                  return r.read().decode("utf-8", errors="replace")
+              request = urllib.request.Request(url, headers=HEADERS)
 
-          def clean_html(value):
-              value = re.sub(r"<script\b[^>]*>.*?</script>", " ", value, flags=re.I | re.S)
-              value = re.sub(r"<style\b[^>]*>.*?</style>", " ", value, flags=re.I | re.S)
-              value = re.sub(r"<[^>]+>", " ", value)
-              value = unescape(value)
-              value = re.sub(r"\s+", " ", value).strip()
-              return value
+              try:
+                  with urllib.request.urlopen(request, timeout=45) as response:
+                      return response.read().decode("utf-8", errors="replace")
+              except urllib.error.HTTPError as error:
+                  body = error.read().decode("utf-8", errors="replace")
+                  raise RuntimeError(
+                      f"HTTP {error.code} while fetching {url}: {body[:500]}"
+                  )
 
-          def absolute(base, href):
-              return urllib.parse.urljoin(base, href)
+
+          def absolute_url(base, value):
+              if not value:
+                  return ""
+              return urllib.parse.urljoin(base, value)
+
+
+          def clean_text(value):
+              value = unescape(value or "")
+              value = re.sub(r"\s+", " ", value)
+              return value.strip()
+
+
+          class LinkParser(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.links = []
+                  self.current_href = None
+                  self.current_text = []
+
+              def handle_starttag(self, tag, attrs):
+                  if tag.lower() == "a":
+                      attributes = dict(attrs)
+                      self.current_href = attributes.get("href")
+                      self.current_text = []
+
+              def handle_data(self, data):
+                  if self.current_href is not None:
+                      self.current_text.append(data)
+
+              def handle_endtag(self, tag):
+                  if tag.lower() == "a" and self.current_href is not None:
+                      text = clean_text(" ".join(self.current_text))
+
+                      if self.current_href and text:
+                          self.links.append(
+                              (self.current_href, text)
+                          )
+
+                      self.current_href = None
+                      self.current_text = []
+
 
           def extract_links(html, base):
-              pattern = re.compile(
-                  r'<a\b[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
-                  re.I | re.S
+              parser = LinkParser()
+              parser.feed(html)
+
+              result = []
+
+              for href, title in parser.links:
+                  result.append(
+                      (
+                          absolute_url(base, href),
+                          title
+                      )
+                  )
+
+              return result
+
+
+          class ArticleParser(HTMLParser):
+              BLOCK_TAGS = {
+                  "h1",
+                  "h2",
+                  "h3",
+                  "h4",
+                  "h5",
+                  "h6",
+                  "p",
+                  "li",
+                  "blockquote",
+                  "pre",
+              }
+
+              def __init__(self):
+                  super().__init__()
+
+                  self.article_depth = 0
+                  self.main_depth = 0
+
+                  self.article_blocks = []
+                  self.main_blocks = []
+
+                  self.article_images = []
+                  self.main_images = []
+
+                  self.current_tag = None
+                  self.current_buffer = []
+                  self.current_depth = 0
+
+                  self.list_depth = 0
+
+              def in_article(self):
+                  return self.article_depth > 0
+
+              def in_main(self):
+                  return self.main_depth > 0
+
+              def target(self):
+                  if self.in_article():
+                      return "article"
+
+                  if self.in_main():
+                      return "main"
+
+                  return None
+
+              def handle_starttag(self, tag, attrs):
+                  tag = tag.lower()
+                  attributes = dict(attrs)
+
+                  if tag == "article":
+                      self.article_depth += 1
+
+                  if tag == "main":
+                      self.main_depth += 1
+
+                  if tag == "li":
+                      self.list_depth += 1
+
+                  if tag == "img":
+                      src = (
+                          attributes.get("src")
+                          or attributes.get("data-src")
+                          or attributes.get("data-lazy-src")
+                      )
+
+                      alt = clean_text(attributes.get("alt", ""))
+
+                      if src and self.target():
+                          item = {
+                              "url": src,
+                              "alt": alt
+                          }
+
+                          target = (
+                              self.article_images
+                              if self.in_article()
+                              else self.main_images
+                          )
+
+                          target.append(item)
+
+                  if tag in self.BLOCK_TAGS:
+                      if self.current_tag is None:
+                          self.current_tag = tag
+                          self.current_buffer = []
+                          self.current_depth = 1
+                      else:
+                          self.current_depth += 1
+
+              def handle_startendtag(self, tag, attrs):
+                  self.handle_starttag(tag, attrs)
+                  self.handle_endtag(tag)
+
+              def handle_data(self, data):
+                  if self.current_tag is not None:
+                      self.current_buffer.append(data)
+
+              def handle_endtag(self, tag):
+                  tag = tag.lower()
+
+                  if tag in self.BLOCK_TAGS and self.current_tag is not None:
+                      if self.current_depth > 1:
+                          self.current_depth -= 1
+                      else:
+                          text = clean_text(
+                              " ".join(self.current_buffer)
+                          )
+
+                          if text:
+                              if self.in_article():
+                                  self.article_blocks.append(
+                                      (self.current_tag, text)
+                                  )
+                              elif self.in_main():
+                                  self.main_blocks.append(
+                                      (self.current_tag, text)
+                                  )
+
+                          self.current_tag = None
+                          self.current_buffer = []
+                          self.current_depth = 0
+
+                  if tag == "li":
+                      self.list_depth = max(0, self.list_depth - 1)
+
+                  if tag == "article":
+                      self.article_depth = max(
+                          0,
+                          self.article_depth - 1
+                      )
+
+                  if tag == "main":
+                      self.main_depth = max(
+                          0,
+                          self.main_depth - 1
+                      )
+
+
+          def extract_article(url):
+              html = fetch(url)
+
+              parser = ArticleParser()
+              parser.feed(html)
+
+              blocks = (
+                  parser.article_blocks
+                  if parser.article_blocks
+                  else parser.main_blocks
               )
 
-              results = []
+              images = (
+                  parser.article_images
+                  if parser.article_blocks
+                  else parser.main_images
+              )
 
-              for href, raw_text in pattern.findall(html):
-                  text = clean_html(raw_text)
+              title = ""
 
-                  if not href or not text:
-                      continue
+              for tag, text in blocks:
+                  if tag == "h1":
+                      title = text
+                      break
 
-                  href = absolute(base, href)
+              if not title:
+                  title = "Discord Update"
 
-                  if not href.startswith("https://discord.com/"):
-                      continue
+              date_match = re.search(
+                  r"\b(?:January|February|March|April|May|June|"
+                  r"July|August|September|October|November|December)"
+                  r"\s+\d{1,2},\s+20\d{2}\b",
+                  html
+              )
 
-                  if len(text) < 8:
-                      continue
+              date = (
+                  date_match.group(0)
+                  if date_match
+                  else ""
+              )
 
-                  results.append((text, href))
-
-              return results
-
-          def extract_blog_article(html):
-              links = extract_links(html, "https://discord.com/blog")
-
-              candidates = []
-
-              for title, url in links:
-                  low = title.lower()
-
-                  if (
-                      "patch notes" in low
-                      or "changelog" in low
-                      or "discord update" in low
-                      or "social sdk" in low
-                      or "engineering" in low
-                  ):
-                      candidates.append((title, url))
+              output = []
 
               seen = set()
 
-              for title, url in candidates:
-                  if url in seen:
+              for tag, text in blocks:
+                  if text in seen:
                       continue
 
-                  seen.add(url)
+                  seen.add(text)
 
-                  if "/blog/" in url:
-                      return {
-                          "title": title,
-                          "url": url
-                      }
+                  if text == title:
+                      continue
+
+                  if date and text == date:
+                      continue
+
+                  if tag.startswith("h"):
+                      output.append(f"## {text}")
+
+                  elif tag == "li":
+                      output.append(f"- {text}")
+
+                  elif tag == "blockquote":
+                      output.append(f"> {text}")
+
+                  else:
+                      output.append(text)
+
+              content = "\n\n".join(output)
+
+              content = re.sub(
+                  r"\n{3,}",
+                  "\n\n",
+                  content
+              ).strip()
+
+              image_urls = []
+
+              for image in images:
+                  image_url = absolute_url(url, image["url"])
+
+                  if not image_url:
+                      continue
+
+                  if image_url.startswith("data:"):
+                      continue
+
+                  if image_url in image_urls:
+                      continue
+
+                  low = image_url.lower()
+
+                  if low.endswith(".svg"):
+                      continue
+
+                  image_urls.append(image_url)
+
+                  if len(image_urls) >= 4:
+                      break
+
+              return {
+                  "title": title,
+                  "date": date,
+                  "url": url,
+                  "content": content,
+                  "images": image_urls,
+              }
+
+
+          def find_latest_tag_article(tag_url, matcher):
+              html = fetch(tag_url)
+
+              links = extract_links(
+                  html,
+                  tag_url
+              )
+
+              for url, title in links:
+                  if not url.startswith("https://discord.com/"):
+                      continue
+
+                  if "/blog/" not in url:
+                      continue
+
+                  if matcher(title):
+                      return extract_article(url)
 
               return None
 
-          def extract_newsletter(html):
+
+          def find_latest_newsletter():
+              html = fetch(
+                  "https://discord.com/developers/developer-newsletter"
+              )
+
               links = extract_links(
                   html,
                   "https://discord.com/developers/developer-newsletter"
               )
 
-              candidates = []
-
-              for title, url in links:
-                  low = title.lower()
-
-                  if (
-                      "2026" in title
-                      or "2025" in title
-                      or "developer" in low
-                      or "discord" in low
-                  ):
-                      candidates.append((title, url))
-
-              for title, url in candidates:
+              for url, title in links:
                   if "/developer-newsletter/" in url:
-                      return {
-                          "title": title,
-                          "url": url
-                      }
+                      return extract_article(url)
 
               return None
 
-          def extract_social_sdk(html):
-              text = clean_html(html)
 
-              versions = re.findall(
-                  r'\b(\d+\.\d+\.\d+)\s*\((\d{4}-\d{2}-\d{2})\)',
+          def parse_changelog():
+              mdx = fetch(CHANGELOG_RAW)
+
+              pattern = re.compile(
+                  r'<Update\b'
+                  r'(?=[^>]*\blabel="([^"]+)")'
+                  r'(?=[^>]*\btags=\{\[([^\]]*)\]\})'
+                  r'[^>]*>'
+                  r'(.*?)'
+                  r'</Update>',
+                  re.I | re.S
+              )
+
+              entries = []
+
+              for match in pattern.finditer(mdx):
+                  date = match.group(1).strip()
+
+                  tags_raw = match.group(2)
+
+                  tags = re.findall(
+                      r'"([^"]+)"',
+                      tags_raw
+                  )
+
+                  body = match.group(3).strip()
+
+                  if not body:
+                      continue
+
+                  entries.append({
+                      "date": date,
+                      "tags": tags,
+                      "body": body,
+                  })
+
+              return entries
+
+
+          def clean_mdx(text):
+              text = re.sub(
+                  r"<!--.*?-->",
+                  "",
+                  text,
+                  flags=re.S
+              )
+
+              text = re.sub(
+                  r"^\s*import .*?$",
+                  "",
+                  text,
+                  flags=re.M
+              )
+
+              text = re.sub(
+                  r"<[^>]+>",
+                  "",
                   text
               )
 
-              if not versions:
-                  return None
+              def fix_link(match):
+                  label = match.group(1)
+                  url = match.group(2)
 
-              version, date = versions[0]
+                  if url.startswith("/"):
+                      url = "https://discord.com" + url
 
-              return {
-                  "title": f"Discord Social SDK {version}",
-                  "url": "https://discord.com/developers/docs/social-sdk/release_notes.html",
-                  "date": date
-              }
+                  return f"[{label}]({url})"
 
-          def make_id(item):
-              raw = item["url"] + "|" + item["title"] + "|" + item.get("date", "")
-              return hashlib.sha256(raw.encode()).hexdigest()
-
-          def state_path(category):
-              return STATE_DIR / f"{category}.state"
-
-          def read_state(category):
-              p = state_path(category)
-
-              if not p.exists():
-                  return ""
-
-              return p.read_text().strip()
-
-          def write_state(category, value):
-              state_path(category).write_text(value)
-
-          def send(category, item):
-              secret_name = SOURCES[category]["webhook"]
-              webhook = os.environ.get(secret_name, "").strip()
-
-              if not webhook:
-                  raise RuntimeError(f"{secret_name} is empty")
-
-              payload = {
-                  "flags": 32768,
-                  "components": [
-                      {
-                          "type": 17,
-                          "components": [
-                              {
-                                  "type": 10,
-                                  "content": f"## {item['title']}"
-                              },
-                              {
-                                  "type": 14,
-                                  "spacing": 1
-                              },
-                              {
-                                  "type": 10,
-                                  "content": f"[Read the full update]({item['url']})"
-                              }
-                          ]
-                      }
-                  ]
-              }
-
-              data = json.dumps(payload).encode("utf-8")
-
-              req = urllib.request.Request(
-                  webhook + "?with_components=true&wait=true",
-                  data=data,
-                  headers={
-                      "Content-Type": "application/json",
-                      "User-Agent": "DiscordDocsNews/1.0"
-                  },
-                  method="POST"
+              text = re.sub(
+                  r"\[([^\]]+)\]\(([^)]+)\)",
+                  fix_link,
+                  text
               )
 
-              try:
-                  with urllib.request.urlopen(req, timeout=30) as response:
-                      body = response.read().decode("utf-8", errors="replace")
-                      print(f"{category}: Discord HTTP {response.status}")
-                      print(body[:500])
-              except urllib.error.HTTPError as e:
-                  body = e.read().decode("utf-8", errors="replace")
-                  raise RuntimeError(
-                      f"{category}: Discord HTTP {e.code}: {body}"
-                  )
+              text = re.sub(
+                  r"!\[([^\]]*)\]\(([^)]+)\)",
+                  "",
+                  text
+              )
 
-          def process(category, item):
-              if not item:
-                  print(f"{category}: no update found")
-                  return
+              text = re.sub(
+                  r"\n{3,}",
+                  "\n\n",
+                  text
+              )
 
-              item["id"] = make_id(item)
+              return text.strip()
 
-              print(f"{category}: {item['title']}")
-              print(f"{category}: {item['url']}")
-              print(f"{category}: {item['id']}")
 
-              old = read_state(category)
+          def changelog_entry(entry):
+              body = clean_mdx(entry["body"])
 
-              if old == item["id"]:
-                  print(f"{category}: already sent")
-                  return
+              title = ""
 
-              send(category, item)
-              write_state(category, item["id"])
-              print(f"{category}: sent successfully")
+              for line in body.splitlines():
+                  line = line.strip()
 
-          print("Starting Discord update scan...")
-          print("Time:", datetime.utcnow().isoformat())
+                  if line.startswith("## "):
+                      title = line[3:].strip()
+                      break
 
-          blog = fetch("https://discord.com/blog")
-          newsletter = fetch(
-              "https://discord.com/developers/developer-newsletter"
-          )
-          social_sdk = fetch(
-              "https://discord.com/developers/docs/social-sdk/release_notes.html"
-          )
+              if not title:
+                  title = "Discord Developer Changelog"
 
-          patch = None
-          changelog = None
-          breaking = None
-
-          blog_links = extract_links(blog, "https://discord.com/blog")
-
-          for title, url in blog_links:
-              low = title.lower()
-
-              item = {
+              return {
                   "title": title,
-                  "url": url
+                  "date": entry["date"],
+                  "url": CHANGELOG_PAGE,
+                  "content": body,
+                  "images": [],
               }
 
-              if not patch and "patch notes" in low:
-                  patch = item
 
-              if not changelog and "changelog" in low:
-                  changelog = item
+          def find_changelog_category(entries, category):
+              for entry in entries:
+                  tags = {
+                      tag.lower()
+                      for tag in entry["tags"]
+                  }
 
-              if not breaking and (
-                  "breaking" in low
-                  or "security" in low
-              ):
-                  breaking = item
+                  if category == "api":
+                      if (
+                          "http api" in tags
+                          or "interactions" in tags
+                      ):
+                          return changelog_entry(entry)
 
-          developer_news = extract_newsletter(newsletter)
-          sdk = extract_social_sdk(social_sdk)
+                  elif category == "social_sdk":
+                      if "discord social sdk" in tags:
+                          return changelog_entry(entry)
 
-          api = None
-          docs = None
+                  elif category == "breaking":
+                      if "breaking change" in tags:
+                          return changelog_entry(entry)
 
-          api_links = extract_links(
-              "https://discord.com/developers/docs/change-log",
-              "https://discord.com/developers/docs/change-log"
-          )
+                  elif category == "docs":
+                      if (
+                          "documentation" in tags
+                          or "docs" in tags
+                          or "documentation changes" in tags
+                      ):
+                          return changelog_entry(entry)
 
-          api = {
-              "title": "Discord API Developer Changelog",
-              "url": "https://discord.com/developers/docs/change-log"
-          }
+              return None
 
-          docs = {
-              "title": "Discord Developer Documentation",
-              "url": "https://discord.com/developers/docs"
-          }
 
-          process("patch_notes", patch)
-          process("developer_news", developer_news)
-          process("changelog", changelog)
-          process("social_sdk", sdk)
-          process("api", api)
-          process("docs", docs)
-          process("breaking", breaking)
+          def make_id(item):
+              raw = (
+                  item["url"]
+                  + "|"
+                  + item["title"]
+                  + "|"
+                  + item.get("date", "")
+                  + "|"
+                  + item.get("content", "")
+              )
 
-          print("Scan completed.")
-          PY
+              return hashlib.sha256(
+                  raw.encode("utf-8")
+              ).hexdigest()
+
+
+          def state_file(category):
+              return STATE_DIR / f"{category}.state"
+
+
+          def read_state(category):
+              path = state_file(category)
+
+              if not path.exists():
+                  return ""
+
+              return path.read_text(
+                  encoding="utf-8"
+              ).strip()
+
+
+          def write_state(category, value):
+              state_file(category).write_text(
+                  value,
+                  encoding="utf-8"
+              )
+
+
+          def split_content(text, limit=3500):
+              paragraphs = text.split("\n\n")
+
+              chunks = []
+              current = ""
+
+              for paragraph in paragraphs:
+                  paragraph = paragraph.strip()
+
+                  if not paragraph:
+                      continue
+
+                  candidate = (
+                      paragraph
+                      if not current
+                      else current + "\n\n" + paragraph
+                  )
+
+                  if len(candidate) <= limit:
+                      current = candidate
+                      continue
+
+                  if current:
+                      chunks.append(current)
+
+                  if len(paragraph) <= limit:
+                      current = paragraph
+                      continue
+
+                  while len(paragraph) > limit:
+                      cut = paragraph.rfind(
+                          "\n",
+                          0,
+                          limit
+                      )
+
+                      if cut < 1000:
+                          cut = paragraph.rfind(
+                              " ",
+                              0,
+                              limit
+                          )
+
+                      if cut < 1000:
+                          cut = limit
+
+                      chunks.append(
+                          paragraph[:cut].strip()
+                      )
+
+                      paragraph = paragraph[cut:].strip()
+
+                  current = paragraph
+
+              if current:
+                  chunks.append(current)
+
+              return chunks or [""]
+
+
+          def media_component(images):
+              if not images:
+                  return None
+
+              items = []
+
+              for url in images:
+                  items.append({
+                      "type": 1,
+                      "media": {
+                          "url": url
+                      }
+                  })
+
+              return {
+                  "type": 
