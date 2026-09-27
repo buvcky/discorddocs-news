@@ -49,40 +49,23 @@ jobs:
           STATE.mkdir(exist_ok=True)
 
           HEADERS = {
-              "User-Agent": "Mozilla/5.0 (DiscordDocsNews/3.0)",
+              "User-Agent": "Mozilla/5.0 DiscordDocsNews/4.0",
               "Accept": "text/html,application/xhtml+xml,*/*",
           }
 
-
           def fetch(url):
-              request = urllib.request.Request(
-                  url,
-                  headers=HEADERS
-              )
+              req = urllib.request.Request(url, headers=HEADERS)
 
               try:
-                  with urllib.request.urlopen(
-                      request,
-                      timeout=45
-                  ) as response:
-                      return response.read().decode(
-                          "utf-8",
-                          "replace"
-                      )
-
-              except urllib.error.HTTPError as error:
-                  body = error.read().decode(
-                      "utf-8",
-                      "replace"
-                  )
-
+                  with urllib.request.urlopen(req, timeout=40) as r:
+                      return r.read().decode("utf-8", "replace")
+              except urllib.error.HTTPError as e:
+                  body = e.read().decode("utf-8", "replace")
                   raise RuntimeError(
-                      f"HTTP {error.code} fetching {url}: "
-                      f"{body[:500]}"
+                      f"HTTP {e.code} fetching {url}: {body[:300]}"
                   )
 
-
-          def clean(value):
+          def text(value):
               value = unescape(value or "")
 
               value = re.sub(
@@ -94,13 +77,6 @@ jobs:
 
               value = re.sub(
                   r"<style\b[^>]*>.*?</style>",
-                  " ",
-                  value,
-                  flags=re.I | re.S
-              )
-
-              value = re.sub(
-                  r"<svg\b[^>]*>.*?</svg>",
                   " ",
                   value,
                   flags=re.I | re.S
@@ -120,9 +96,8 @@ jobs:
 
               return value.strip()
 
-
-          def get_links(html, base_url):
-              results = []
+          def links(html, base):
+              result = []
 
               pattern = re.compile(
                   r'<a\b[^>]*href=["\']([^"\']+)["\'][^>]*>'
@@ -131,40 +106,37 @@ jobs:
                   re.I | re.S
               )
 
-              for href, content in pattern.findall(html):
-                  title = clean(content)
+              for href, body in pattern.findall(html):
+                  title = text(body)
 
                   if not title:
                       continue
 
                   url = urllib.parse.urljoin(
-                      base_url,
+                      base,
                       unescape(href)
                   )
 
-                  if not url.startswith(
+                  if url.startswith(
                       "https://discord.com/"
                   ):
-                      continue
+                      result.append(
+                          (url, title)
+                      )
 
-                  results.append(
-                      (url, title)
-                  )
+              return result
 
-              return results
-
-
-          def get_meta(html, name):
+          def meta(html, key):
               patterns = [
-                  rf'<meta\b[^>]*(?:property|name)=["\']{re.escape(name)}["\'][^>]*content=["\']([^"\']+)["\']',
-                  rf'<meta\b[^>]*content=["\']([^"\']+)["\'][^>]*(?:property|name)=["\']{re.escape(name)}["\']',
+                  rf'<meta\b[^>]*(?:property|name)=["\']{re.escape(key)}["\'][^>]*content=["\']([^"\']+)["\']',
+                  rf'<meta\b[^>]*content=["\']([^"\']+)["\'][^>]*(?:property|name)=["\']{re.escape(key)}["\']',
               ]
 
               for pattern in patterns:
                   match = re.search(
                       pattern,
                       html,
-                      flags=re.I
+                      re.I
                   )
 
                   if match:
@@ -174,31 +146,28 @@ jobs:
 
               return ""
 
-
-          def extract_article(url):
+          def article(url):
               html = fetch(url)
 
-              title = get_meta(
+              title = meta(
                   html,
                   "og:title"
               )
 
               if not title:
                   match = re.search(
-                      r"<title[^>]*>(.*?)</title>",
+                      r"<h1\b[^>]*>(.*?)</h1>",
                       html,
-                      flags=re.I | re.S
+                      re.I | re.S
                   )
 
-                  if match:
-                      title = clean(
-                          match.group(1)
-                      )
+                  title = (
+                      text(match.group(1))
+                      if match
+                      else "Discord Update"
+                  )
 
-              if not title:
-                  title = "Discord Update"
-
-              date = get_meta(
+              date = meta(
                   html,
                   "article:published_time"
               )
@@ -206,35 +175,17 @@ jobs:
               if date:
                   date = date[:10]
 
-              if not date:
-                  match = re.search(
-                      r"\b(?:January|February|March|April|May|June|"
-                      r"July|August|September|October|November|December)"
-                      r"\s+\d{1,2},\s+20\d{2}\b",
-                      html,
-                      flags=re.I
-                  )
-
-                  if match:
-                      date = match.group(0)
-
-              article_match = re.search(
+              match = re.search(
                   r"<article\b[^>]*>(.*?)</article>",
                   html,
-                  flags=re.I | re.S
+                  re.I | re.S
               )
 
-              if not article_match:
-                  article_match = re.search(
-                      r"<main\b[^>]*>(.*?)</main>",
-                      html,
-                      flags=re.I | re.S
-                  )
-
-              if article_match:
-                  body = article_match.group(1)
-              else:
-                  body = html
+              body = (
+                  match.group(1)
+                  if match
+                  else html
+              )
 
               body = re.sub(
                   r"<script\b[^>]*>.*?</script>",
@@ -288,13 +239,11 @@ jobs:
                       line
                   ).strip()
 
-                  if not line:
-                      continue
-
-                  if lines and line == lines[-1]:
-                      continue
-
-                  lines.append(line)
+                  if line and (
+                      not lines or
+                      line != lines[-1]
+                  ):
+                      lines.append(line)
 
               content = "\n\n".join(
                   lines
@@ -311,84 +260,85 @@ jobs:
 
               images = []
 
-              for image in [
-                  get_meta(html, "og:image"),
-                  get_meta(html, "twitter:image"),
-              ]:
-                  if not image:
-                      continue
-
-                  image = urllib.parse.urljoin(
-                      url,
-                      image
+              for key in (
+                  "og:image",
+                  "twitter:image"
+              ):
+                  value = meta(
+                      html,
+                      key
                   )
 
-                  if image not in images:
-                      images.append(image)
+                  if not value:
+                      continue
+
+                  value = urllib.parse.urljoin(
+                      url,
+                      value
+                  )
+
+                  if (
+                      value.startswith("http")
+                      and value not in images
+                  ):
+                      images.append(value)
 
               return {
                   "title": title,
                   "date": date,
                   "url": url,
                   "content": content,
-                  "images": images[:3],
+                  "images": images[:1],
               }
 
-
-          def latest_from_tag(tag_url, phrase):
+          def latest_tag(tag_url, phrase):
               html = fetch(tag_url)
 
               candidates = []
 
-              for url, title in get_links(
+              for url, title in links(
                   html,
                   tag_url
               ):
-                  if "/blog/" not in url:
-                      continue
-
-                  if phrase.lower() not in title.lower():
-                      continue
-
-                  candidates.append(
-                      (url, title)
-                  )
+                  if (
+                      "/blog/" in url
+                      and phrase.lower()
+                      in title.lower()
+                  ):
+                      candidates.append(url)
 
               if not candidates:
                   raise RuntimeError(
-                      f"No '{phrase}' article found at {tag_url}"
+                      f"No {phrase} article found at {tag_url}"
                   )
 
-              return extract_article(
-                  candidates[0][0]
+              return article(
+                  candidates[0]
               )
 
-
-          def latest_newsletter():
-              url = (
+          def newsletter():
+              base = (
                   "https://discord.com/"
                   "developers/developer-newsletter"
               )
 
-              html = fetch(url)
+              html = fetch(base)
 
-              for article_url, title in get_links(
+              for url, title in links(
                   html,
-                  url
+                  base
               ):
-                  if "/developer-newsletter/" not in article_url:
-                      continue
-
-                  return extract_article(
-                      article_url
-                  )
+                  if (
+                      "/developer-newsletter/"
+                      in url
+                  ):
+                      return article(url)
 
               raise RuntimeError(
                   "No developer newsletter found"
               )
 
-
-          def developer_changelog():
+          def changelog():
               url = (
                   "https://discord.com/"
                   "developers/docs/change-log"
@@ -396,18 +346,21 @@ jobs:
 
               html = fetch(url)
 
-              title = "Discord Developer Changelog"
-
-              body_match = re.search(
-                  r"<main\b[^>]*>(.*?)</main>",
-                  html,
-                  flags=re.I | re.S
+              title = (
+                  "Discord Developer Changelog"
               )
 
-              if body_match:
-                  body = body_match.group(1)
-              else:
-                  body = html
+              match = re.search(
+                  r"<main\b[^>]*>(.*?)</main>",
+                  html,
+                  re.I | re.S
+              )
+
+              body = (
+                  match.group(1)
+                  if match
+                  else html
+              )
 
               body = re.sub(
                   r"<script\b[^>]*>.*?</script>",
@@ -459,7 +412,7 @@ jobs:
 
               content = "\n\n".join(
                   lines
-              ).strip()
+              )
 
               return {
                   "title": title,
@@ -469,17 +422,13 @@ jobs:
                   "images": [],
               }
 
-
-          def find_section(item, keywords):
-              content = item["content"]
-
-              lower = content.lower()
-
+          def section(item, terms):
+              lower = item["content"].lower()
               positions = []
 
-              for keyword in keywords:
+              for term in terms:
                   position = lower.find(
-                      keyword.lower()
+                      term.lower()
                   )
 
                   if position >= 0:
@@ -494,31 +443,30 @@ jobs:
 
               start = max(
                   0,
-                  position - 700
+                  position - 500
               )
 
               end = min(
-                  len(content),
-                  position + 3600
+                  len(item["content"]),
+                  position + 3500
               )
-
-              section = content[start:end].strip()
 
               return {
                   "title": item["title"],
                   "date": item["date"],
                   "url": item["url"],
-                  "content": section,
+                  "content": item["content"][
+                      start:end
+                  ].strip(),
                   "images": item["images"],
               }
 
-
-          def split_content(content, limit=3600):
+          def chunks(content, limit=3500):
               paragraphs = content.split(
                   "\n\n"
               )
 
-              chunks = []
+              result = []
               current = ""
 
               for paragraph in paragraphs:
@@ -530,7 +478,9 @@ jobs:
                   candidate = (
                       paragraph
                       if not current
-                      else current + "\n\n" + paragraph
+                      else current
+                      + "\n\n"
+                      + paragraph
                   )
 
                   if len(candidate) <= limit:
@@ -538,9 +488,7 @@ jobs:
                       continue
 
                   if current:
-                      chunks.append(
-                          current
-                      )
+                      result.append(current)
 
                   while len(paragraph) > limit:
                       cut = paragraph.rfind(
@@ -552,7 +500,7 @@ jobs:
                       if cut < 500:
                           cut = limit
 
-                      chunks.append(
+                      result.append(
                           paragraph[:cut].strip()
                       )
 
@@ -563,95 +511,77 @@ jobs:
                   current = paragraph
 
               if current:
-                  chunks.append(
-                      current
-                  )
+                  result.append(current)
 
-              return chunks or [""]
+              return result or [""]
 
-
-          def get_state(category):
-              path = STATE / (
-                  f"{category}.state"
-              )
-
-              if not path.exists():
-                  return ""
-
-              return path.read_text(
-                  encoding="utf-8"
-              ).strip()
-
-
-          def save_state(category, value):
-              path = STATE / (
-                  f"{category}.state"
-              )
-
-              path.write_text(
-                  value,
-                  encoding="utf-8"
-              )
-
-
-          def send(category, item, webhook_name):
+          def send(category, item, secret):
               webhook = os.environ.get(
-                  webhook_name,
+                  secret,
                   ""
               ).strip()
 
               if not webhook:
                   raise RuntimeError(
-                      f"{webhook_name} is empty"
+                      f"{secret} is empty"
                   )
 
-              identity = (
-                  item["url"]
-                  + "|"
-                  + item["title"]
-                  + "|"
-                  + item["date"]
-                  + "|"
-                  + item["content"]
+              identity = json.dumps(
+                  item,
+                  ensure_ascii=False,
+                  sort_keys=True
               )
 
               update_id = hashlib.sha256(
                   identity.encode("utf-8")
               ).hexdigest()
 
-              if get_state(category) == update_id:
+              state = STATE / (
+                  f"{category}.state"
+              )
+
+              if (
+                  state.exists()
+                  and state.read_text(
+                      encoding="utf-8"
+                  ).strip() == update_id
+              ):
                   print(
                       f"{category}: already sent"
                   )
                   return
 
-              chunks = split_content(
+              parts = chunks(
                   item["content"]
               )
 
               print(
                   f"{category}: "
-                  f"{len(chunks)} message(s)"
+                  f"{len(parts)} message(s)"
               )
 
-              for index, chunk in enumerate(
-                  chunks
+              for index, part in enumerate(
+                  parts
               ):
                   components = []
 
-                  if index == 0:
-                      for image in item["images"][:1]:
-                          components.append({
-                              "type": 12,
-                              "items": [
-                                  {
-                                      "type": 1,
-                                      "media": {
-                                          "url": image
-                                      }
+                  if (
+                      index == 0
+                      and item["images"]
+                  ):
+                      components.append({
+                          "type": 12,
+                          "items": [
+                              {
+                                  "type": 1,
+                                  "media": {
+                                      "url": item[
+                                          "images"
+                                      ][0]
                                   }
-                              ]
-                          })
+                              }
+                          ]
+                      })
 
                   components.append({
                       "type": 10,
@@ -664,8 +594,8 @@ jobs:
                       components.append({
                           "type": 10,
                           "content": (
-                              f"**Published:** "
-                              f"{item['date']}"
+                              "**Published:** "
+                              + item["date"]
                           )
                       })
 
@@ -676,7 +606,7 @@ jobs:
 
                   components.append({
                       "type": 10,
-                      "content": chunk
+                      "content": part
                   })
 
                   components.append({
@@ -690,9 +620,7 @@ jobs:
                           {
                               "type": 2,
                               "style": 5,
-                              "label": (
-                                  "View Source"
-                              ),
+                              "label": "View Source",
                               "url": item["url"]
                           }
                       ]
@@ -721,7 +649,7 @@ jobs:
                           "Content-Type":
                               "application/json",
                           "User-Agent":
-                              "DiscordDocsNews/3.0",
+                              "DiscordDocsNews/4.0"
                       },
                       method="POST"
                   )
@@ -729,16 +657,14 @@ jobs:
                   try:
                       with urllib.request.urlopen(
                           request,
-                          timeout=45
+                          timeout=40
                       ) as response:
-                          response.read()
-
                           print(
                               f"{category}: "
                               f"HTTP {response.status} "
                               f"part "
                               f"{index + 1}/"
-                              f"{len(chunks)}"
+                              f"{len(parts)}"
                           )
 
                   except urllib.error.HTTPError as error:
@@ -749,4 +675,74 @@ jobs:
 
                       raise RuntimeError(
                           f"{category}: Discord HTTP "
-       
+                          f"{error.code}: "
+                          f"{body[:1000]}"
+                      )
+
+              state.write_text(
+                  update_id,
+                  encoding="utf-8"
+              )
+
+              print(
+                  f"{category}: sent"
+              )
+
+          patch = latest_tag(
+              "https://discord.com/tags/patch-notes",
+              "Patch Notes"
+          )
+
+          change = latest_tag(
+              "https://discord.com/tags/changelog",
+              "Changelog"
+          )
+
+          news = newsletter()
+
+          developer_log = changelog()
+
+          updates = [
+              (
+                  "patch_notes",
+                  patch,
+                  "WEBHOOK_PATCH_NOTES"
+              ),
+              (
+                  "changelog",
+                  change,
+                  "WEBHOOK_CHANGELOG"
+              ),
+              (
+                  "developer_news",
+                  news,
+                  "WEBHOOK_DEVELOPER_NEWS"
+              ),
+              (
+                  "api",
+                  section(
+                      developer_log,
+                      [
+                          "HTTP API",
+                          "API Changes",
+                          "REST API"
+                      ]
+                  ),
+                  "WEBHOOK_API"
+              ),
+              (
+                  "docs",
+                  section(
+                      developer_log,
+                      [
+                          "Documentation",
+                          "Docs"
+                      ]
+                  ),
+                  "WEBHOOK_DOCS"
+              ),
+              (
+                  "social_sdk",
+                  section(
+                      developer_log,
+                      
