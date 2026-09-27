@@ -16,142 +16,132 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      # ------------------------------------------------------------
-      # Discover the latest official Discord sources
-      # ------------------------------------------------------------
-      - name: Discover official sources
-        id: sources
+      - name: Discover official updates
+        id: discover
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           python3 <<'PY'
           import json
           import re
-          import hashlib
           import html
+          import hashlib
           import os
           import urllib.request
           from urllib.parse import urljoin
 
-          UA = "Mozilla/5.0 (compatible; DiscordDocsNews/1.0)"
+          UA = "DiscordDocsNews/1.0"
 
-          def fetch(url, headers=None):
-              h = {"User-Agent": UA}
-              if headers:
-                  h.update(headers)
+          def get(url, github=False):
+              headers = {"User-Agent": UA}
+              if github:
+                  headers["Accept"] = "application/vnd.github+json"
+                  headers["Authorization"] = f"Bearer {os.environ['GITHUB_TOKEN']}"
+                  headers["X-GitHub-Api-Version"] = "2026-03-10"
 
-              req = urllib.request.Request(url, headers=h)
+              req = urllib.request.Request(url, headers=headers)
 
               with urllib.request.urlopen(req, timeout=30) as r:
                   return r.read().decode("utf-8", "ignore")
 
-          def fetch_json(url):
-              data = fetch(
-                  url,
-                  {
-                      "Accept": "application/vnd.github+json",
-                      "X-GitHub-Api-Version": "2026-03-10",
-                      "Authorization": f"Bearer {os.environ.get('GITHUB_TOKEN', '')}",
-                  },
-              )
-              return json.loads(data)
-
-          def sha(value):
-              return hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
-
-          def clean_text(value):
-              value = html.unescape(value)
-              value = re.sub(r"<[^>]+>", " ", value)
-              value = re.sub(r"\s+", " ", value)
-              return value.strip()
+          def clean(s):
+              s = html.unescape(s or "")
+              s = re.sub(r"<[^>]+>", " ", s)
+              s = re.sub(r"\s+", " ", s)
+              return s.strip()
 
           def meta(page, name):
               patterns = [
                   rf'<meta[^>]+property=["\']{re.escape(name)}["\'][^>]+content=["\'](.*?)["\']',
-                  rf'<meta[^>]+content=["\'](.*?)["\'][^>]+property=["\']{re.escape(name)}["\']',
+                  rf'<meta[^>]+content=["\'](.*?)["\'][^>]+property=["\']{re.escape(name)}["\']'
               ]
 
-              for pattern in patterns:
-                  m = re.search(pattern, page, re.I | re.S)
+              for p in patterns:
+                  m = re.search(p, page, re.I | re.S)
                   if m:
-                      return clean_text(m.group(1))
+                      return clean(m.group(1))
 
               return ""
 
-          def article_details(url):
+          def details(url):
               try:
-                  page = fetch(url)
-
-                  title = (
-                      meta(page, "og:title")
-                      or meta(page, "twitter:title")
-                  )
-
-                  description = (
-                      meta(page, "og:description")
-                      or meta(page, "twitter:description")
-                      or meta(page, "description")
-                  )
-
-                  image = (
-                      meta(page, "og:image")
-                      or meta(page, "twitter:image")
-                  )
+                  page = get(url)
 
                   return {
-                      "title": title or "Official Discord Update",
-                      "description": description,
-                      "image": image,
+                      "title": (
+                          meta(page, "og:title")
+                          or meta(page, "twitter:title")
+                          or "Official Discord Update"
+                      ),
+                      "description": (
+                          meta(page, "og:description")
+                          or meta(page, "twitter:description")
+                          or meta(page, "description")
+                          or "An official update was published by Discord."
+                      ),
+                      "image": (
+                          meta(page, "og:image")
+                          or meta(page, "twitter:image")
+                      )
                   }
 
               except Exception:
                   return {
                       "title": "Official Discord Update",
-                      "description": "",
-                      "image": "",
+                      "description": "An official update was published by Discord.",
+                      "image": ""
                   }
 
           def find_link(page, pattern):
-              # Look for relative and absolute Discord links.
-              candidates = []
+              matches = []
 
-              regexes = [
+              for m in re.finditer(
                   rf'href=["\'](https://discord\.com{pattern})["\']',
+                  page,
+                  re.I
+              ):
+                  matches.append(m.group(1))
+
+              for m in re.finditer(
                   rf'href=["\']({pattern})["\']',
-              ]
+                  page,
+                  re.I
+              ):
+                  matches.append(urljoin("https://discord.com", m.group(1)))
 
-              for regex in regexes:
-                  for match in re.finditer(regex, page, re.I):
-                      candidates.append(match.group(1))
-
-              # Preserve first occurrence.
               seen = set()
 
-              for candidate in candidates:
-                  candidate = html.unescape(candidate)
-                  candidate = candidate.split("?")[0]
-                  candidate = candidate.rstrip("/")
+              for url in matches:
+                  url = html.unescape(url)
+                  url = url.split("?")[0].rstrip("/")
 
-                  if candidate in seen:
-                      continue
-
-                  seen.add(candidate)
-
-                  if candidate.startswith("/"):
-                      candidate = urljoin("https://discord.com", candidate)
-
-                  return candidate
+                  if url not in seen:
+                      seen.add(url)
+                      return url
 
               return ""
 
+          def make_item(url, source, item_type):
+              d = details(url)
+
+              return {
+                  "found": True,
+                  "id": hashlib.sha256(url.encode()).hexdigest()[:32],
+                  "url": url,
+                  "title": d["title"][:250],
+                  "description": d["description"][:1800],
+                  "image": d["image"],
+                  "source": source,
+                  "type": item_type
+              }
+
           sources = {}
 
-          # ----------------------------------------------------------
-          # 1. Discord Changelog
-          # Official Discord Blog
-          # ----------------------------------------------------------
+          # --------------------------------------------------
+          # Discord Changelog
+          # --------------------------------------------------
           try:
-              page = fetch("https://discord.com/blog")
+              page = get("https://discord.com/blog")
 
               url = find_link(
                   page,
@@ -159,28 +149,20 @@ jobs:
               )
 
               if url:
-                  details = article_details(url)
-
-                  sources["changelog"] = {
-                      "found": True,
-                      "url": url,
-                      "title": details["title"],
-                      "description": details["description"],
-                      "image": details["image"],
-                      "id": sha(url),
-                      "source": "Discord Blog",
-                      "type": "Changelog",
-                  }
+                  sources["changelog"] = make_item(
+                      url,
+                      "Discord Blog",
+                      "Changelog"
+                  )
 
           except Exception as e:
-              print("Changelog discovery failed:", e)
+              print("Changelog error:", e)
 
-          # ----------------------------------------------------------
-          # 2. Discord Patch Notes
-          # Official Patch Notes tag
-          # ----------------------------------------------------------
+          # --------------------------------------------------
+          # Discord Patch Notes
+          # --------------------------------------------------
           try:
-              page = fetch("https://discord.com/tags/patch-notes")
+              page = get("https://discord.com/tags/patch-notes")
 
               url = find_link(
                   page,
@@ -188,28 +170,20 @@ jobs:
               )
 
               if url:
-                  details = article_details(url)
-
-                  sources["patch_notes"] = {
-                      "found": True,
-                      "url": url,
-                      "title": details["title"],
-                      "description": details["description"],
-                      "image": details["image"],
-                      "id": sha(url),
-                      "source": "Discord Patch Notes",
-                      "type": "Patch Notes",
-                  }
+                  sources["patch_notes"] = make_item(
+                      url,
+                      "Discord Patch Notes",
+                      "Patch Notes"
+                  )
 
           except Exception as e:
-              print("Patch Notes discovery failed:", e)
+              print("Patch Notes error:", e)
 
-          # ----------------------------------------------------------
-          # 3. Developer Newsletter
-          # Official Discord Developer Newsletter
-          # ----------------------------------------------------------
+          # --------------------------------------------------
+          # Developer Newsletter
+          # --------------------------------------------------
           try:
-              page = fetch(
+              page = get(
                   "https://discord.com/developers/developer-newsletter"
               )
 
@@ -219,42 +193,40 @@ jobs:
               )
 
               if url:
-                  details = article_details(url)
-
-                  sources["developer_news"] = {
-                      "found": True,
-                      "url": url,
-                      "title": details["title"],
-                      "description": details["description"],
-                      "image": details["image"],
-                      "id": sha(url),
-                      "source": "Discord Developer Newsletter",
-                      "type": "Developer News",
-                  }
+                  sources["developer_news"] = make_item(
+                      url,
+                      "Discord Developer Newsletter",
+                      "Developer News"
+                  )
 
           except Exception as e:
-              print("Developer Newsletter discovery failed:", e)
+              print("Developer News error:", e)
 
-          # ----------------------------------------------------------
-          # 4. Official Discord Developer Docs GitHub repository
-          # ----------------------------------------------------------
+          # --------------------------------------------------
+          # Official Discord GitHub repository
+          # --------------------------------------------------
           try:
               repo = "discord/discord-api-docs"
 
-              commits = fetch_json(
-                  f"https://api.github.com/repos/{repo}/commits?per_page=1"
+              commits = json.loads(
+                  get(
+                      f"https://api.github.com/repos/{repo}/commits?per_page=1",
+                      github=True
+                  )
               )
 
               latest = commits[0]
-
               commit_sha = latest["sha"]
 
-              commit = fetch_json(
-                  f"https://api.github.com/repos/{repo}/commits/{commit_sha}"
+              commit = json.loads(
+                  get(
+                      f"https://api.github.com/repos/{repo}/commits/{commit_sha}",
+                      github=True
+                  )
               )
 
               message = commit["commit"]["message"].strip()
-              subject = message.splitlines()[0].strip()
+              title = message.splitlines()[0][:250]
 
               author = (
                   commit.get("author", {}).get("login")
@@ -262,28 +234,20 @@ jobs:
                   or "Unknown"
               )
 
-              commit_url = commit["html_url"]
-
               files = [
-                  item.get("filename", "")
-                  for item in commit.get("files", [])
-                  if item.get("filename")
+                  f["filename"]
+                  for f in commit.get("files", [])
+                  if f.get("filename")
               ]
 
               combined = (
-                  message
-                  + "\n"
-                  + "\n".join(files)
+                  message + "\n" + "\n".join(files)
               ).lower()
 
-              # --------------------------------------------------------
-              # Classification priority:
-              # Breaking > Social SDK > API > Docs
-              # --------------------------------------------------------
-
+              # Breaking Changes have highest priority.
               if any(
-                  term in combined
-                  for term in [
+                  x in combined
+                  for x in [
                       "breaking change",
                       "breaking-change",
                       "breaking:",
@@ -292,29 +256,29 @@ jobs:
                       "deprecate",
                       "removed",
                       "removal",
-                      "remove endpoint",
+                      "remove endpoint"
                   ]
               ):
                   category = "breaking"
                   category_name = "Breaking Changes"
 
               elif any(
-                  path.startswith("resources/discord-social-sdk/")
-                  or path.startswith("developers/discord-social-sdk/")
-                  for path in files
+                  f.startswith("resources/discord-social-sdk/")
+                  or f.startswith("developers/discord-social-sdk/")
+                  for f in files
               ):
                   category = "social_sdk"
                   category_name = "Social SDK"
 
               elif any(
-                  path == "developers/reference.mdx"
-                  or path.startswith("developers/reference/")
-                  or path.startswith("developers/resources/")
-                  or path.startswith("developers/events/")
-                  or path.startswith("developers/topics/")
-                  or path.startswith("developers/components/")
-                  or path == "developers/change-log.mdx"
-                  for path in files
+                  f == "developers/reference.mdx"
+                  or f.startswith("developers/reference/")
+                  or f.startswith("developers/resources/")
+                  or f.startswith("developers/events/")
+                  or f.startswith("developers/topics/")
+                  or f.startswith("developers/components/")
+                  or f == "developers/change-log.mdx"
+                  for f in files
               ):
                   category = "api"
                   category_name = "API Updates"
@@ -323,61 +287,30 @@ jobs:
                   category = "docs"
                   category_name = "Docs Updates"
 
-              file_text = "\n".join(files[:12])
+              file_list = "\n".join(files[:10])
 
-              if len(files) > 12:
-                  file_text += f"\n+ {len(files) - 12} more files"
+              if len(files) > 10:
+                  file_list += f"\n+ {len(files) - 10} more"
 
-              github_item = {
+              sources[category] = {
                   "found": True,
-                  "url": commit_url,
-                  "title": subject or "Discord Developer Documentation Update",
+                  "id": commit_sha,
+                  "url": commit["html_url"],
+                  "title": title or "Discord Developer Documentation Update",
                   "description": (
-                      "An official update was published in the "
-                      "Discord Developer Documentation."
+                      "An official update was published in "
+                      "the Discord Developer Documentation."
                   ),
                   "image": "",
-                  "id": commit_sha,
                   "source": "Discord Developer Documentation",
                   "type": category_name,
                   "author": author,
                   "commit": commit_sha[:12],
-                  "files": file_text,
-                  "category": category,
+                  "files": file_list
               }
 
-              # Only activate the room that owns this commit.
-              for key in [
-                  "api",
-                  "docs",
-                  "social_sdk",
-                  "breaking",
-              ]:
-                  sources[key] = {
-                      "found": False
-                  }
-
-              sources[category] = github_item
-
           except Exception as e:
-              print("GitHub discovery failed:", e)
-
-          # ----------------------------------------------------------
-          # Guarantee all seven keys exist.
-          # ----------------------------------------------------------
-          for key in [
-              "changelog",
-              "patch_notes",
-              "developer_news",
-              "api",
-              "docs",
-              "social_sdk",
-              "breaking",
-          ]:
-              if key not in sources:
-                  sources[key] = {
-                      "found": False
-                  }
+              print("GitHub error:", e)
 
           with open("sources.json", "w", encoding="utf-8") as f:
               json.dump(
@@ -387,101 +320,89 @@ jobs:
                   indent=2
               )
 
-          # GitHub Actions outputs.
-          output_file = os.environ["GITHUB_OUTPUT"]
-
-          with open(output_file, "a", encoding="utf-8") as out:
-              for key in [
-                  "changelog",
-                  "patch_notes",
-                  "developer_news",
-                  "api",
-                  "docs",
-                  "social_sdk",
-                  "breaking",
-              ]:
-                  item = sources.get(key, {})
-                  found = "true" if item.get("found") else "false"
-                  item_id = item.get("id", "")
-
-                  out.write(f"{key}_found={found}\n")
-                  out.write(f"{key}_id={item_id}\n")
-
-          print(json.dumps(sources, ensure_ascii=False, indent=2))
+          print(json.dumps(
+              sources,
+              ensure_ascii=False,
+              indent=2
+          ))
           PY
 
-      # ------------------------------------------------------------
-      # Prepare sender
-      # ------------------------------------------------------------
-      - name: Prepare Components V2 sender
+      - name: Create Components V2 sender
         run: |
-          cat > send_v2.py <<'PY'
+          cat > send.py <<'PY'
           import json
           import os
           import sys
           import urllib.request
           import urllib.error
 
-          SOURCE_KEY = sys.argv[1]
-          WEBHOOK = os.environ["WEBHOOK_URL"]
+          category = sys.argv[1]
+          webhook = os.environ["WEBHOOK_URL"]
 
           with open("sources.json", "r", encoding="utf-8") as f:
               sources = json.load(f)
 
-          item = sources.get(SOURCE_KEY, {})
+          item = sources.get(category)
 
-          if not item.get("found"):
-              print(f"No source found for {SOURCE_KEY}")
+          if not item or not item.get("found"):
+              print(f"No update for {category}")
               sys.exit(0)
 
-          title = item.get("title", "Official Discord Update")
-          description = item.get("description", "")
+          title = item.get(
+              "title",
+              "Official Discord Update"
+          )
+
+          description = item.get(
+              "description",
+              "An official update was published by Discord."
+          )
+
+          source = item.get(
+              "source",
+              "Discord"
+          )
+
+          item_type = item.get(
+              "type",
+              category
+          )
+
           url = item.get("url", "")
-          source = item.get("source", "Discord")
-          item_type = item.get("type", SOURCE_KEY)
           image = item.get("image", "")
-          author = item.get("author", "")
-          commit = item.get("commit", "")
-          files = item.get("files", "")
 
-          if not description:
-              description = (
-                  "An official update was published by Discord."
-              )
-
-          # Keep the visible text safely below Discord's V2 text budget.
-          description = description[:1800]
-          title = title[:250]
-
-          metadata = (
+          text = (
               f"**Source**\n"
               f"{source}\n\n"
               f"**Type**\n"
               f"{item_type}"
           )
 
-          if author:
-              metadata += (
+          if item.get("author"):
+              text += (
                   f"\n\n**Author**\n"
-                  f"{author}"
+                  f"{item['author']}"
               )
 
-          if commit:
-              metadata += (
+          if item.get("commit"):
+              text += (
                   f"\n\n**Commit**\n"
-                  f"`{commit}`"
+                  f"`{item['commit']}`"
               )
 
-          if files:
-              metadata += (
+          if item.get("files"):
+              text += (
                   f"\n\n**Changed Files**\n"
-                  f"```text\n{files[:900]}\n```"
+                  f"```text\n{item['files'][:900]}\n```"
               )
 
-          components_inside = [
+          inner = [
               {
                   "type": 10,
-                  "content": f"# {title}\n\n{description}"
+                  "content": (
+                      f"# {title}\n\n"
+                      f"{description[:1800]}"
+                  )
               },
               {
                   "type": 14,
@@ -490,13 +411,12 @@ jobs:
               },
               {
                   "type": 10,
-                  "content": metadata
+                  "content": text[:1900]
               }
           ]
 
-          # Add official article image when available.
           if image:
-              components_inside.append(
+              inner.append(
                   {
                       "type": 12,
                       "items": [
@@ -509,69 +429,68 @@ jobs:
                   }
               )
 
-          components_inside.extend(
-              [
-                  {
-                      "type": 14,
-                      "divider": True,
-                      "spacing": 1
-                  },
-                  {
-                      "type": 1,
-                      "components": [
-                          {
-                              "type": 2,
-                              "style": 5,
-                              "label": "Open Official Update",
-                              "url": url
-                          }
-                      ]
-                  }
-              ]
-          )
+          inner.extend([
+              {
+                  "type": 14,
+                  "divider": True,
+                  "spacing": 1
+              },
+              {
+                  "type": 1,
+                  "components": [
+                      {
+                          "type": 2,
+                          "style": 5,
+                          "label": "Open Official Update",
+                          "url": url
+                      }
+                  ]
+              }
+          ])
+
+          usernames = {
+              "changelog": "Changelog Updates",
+              "patch_notes": "Patch Notes",
+              "developer_news": "Developer News",
+              "api": "API Updates",
+              "docs": "Docs Updates",
+              "social_sdk": "Social SDK",
+              "breaking": "Breaking Changes"
+          }
 
           payload = {
-              # This is the webhook display username.
-              # It intentionally does NOT contain the word "Discord".
-              "username": {
-                  "changelog": "Changelog Updates",
-                  "patch_notes": "Patch Notes",
-                  "developer_news": "Developer News",
-                  "api": "API Updates",
-                  "docs": "Docs Updates",
-                  "social_sdk": "Social SDK",
-                  "breaking": "Breaking Changes"
-              }.get(SOURCE_KEY, "Docs Updates"),
+              "username": usernames.get(
+                  category,
+                  "Docs Updates"
+              ),
 
-              # IS_COMPONENTS_V2 = 1 << 15
+              # IS_COMPONENTS_V2
               "flags": 32768,
 
               "components": [
                   {
                       "type": 17,
                       "accent_color": 5793266,
-                      "components": components_inside
+                      "components": inner
                   }
               ]
           }
 
-          # Discord requires with_components=true for webhook V2.
-          separator = "&" if "?" in WEBHOOK else "?"
-          endpoint = (
-              WEBHOOK
+          separator = "&" if "?" in webhook else "?"
+
+          url = (
+              webhook
               + separator
               + "with_components=true"
               + "&wait=true"
           )
 
-          data = json.dumps(
-              payload,
-              ensure_ascii=False
-          ).encode("utf-8")
-
           request = urllib.request.Request(
-              endpoint,
-              data=data,
+              url,
+              data=json.dumps(
+                  payload,
+                  ensure_ascii=False
+              ).encode("utf-8"),
               method="POST",
               headers={
                   "Content-Type": "application/json",
@@ -584,17 +503,10 @@ jobs:
                   request,
                   timeout=30
               ) as response:
-                  body = response.read().decode(
-                      "utf-8",
-                      "ignore"
-                  )
 
                   print(
-                      f"{SOURCE_KEY}: HTTP {response.status}"
+                      f"{category}: HTTP {response.status}"
                   )
-
-                  if body:
-                      print(body)
 
           except urllib.error.HTTPError as e:
               body = e.read().decode(
@@ -603,8 +515,9 @@ jobs:
               )
 
               print(
-                  f"{SOURCE_KEY}: HTTP {e.code}"
+                  f"{category}: HTTP {e.code}"
               )
+
               print(body)
 
               sys.exit(1)
@@ -613,20 +526,170 @@ jobs:
       # ============================================================
       # CHANGELOG
       # ============================================================
-      - name: Restore changelog state
-        if: steps.sources.outputs.changelog_found == 'true'
-        id: cache_changelog
-        uses: actions/cache/restore@v6
-        with:
-          path: .state/changelog
-          key: discord-changelog-${{ steps.sources.outputs.changelog_id }}
-          restore-keys: |
-            discord-changelog-
+      - name: Send Changelog
+        if: ${{ hashFiles('sources.json') != '' }}
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_CHANGELOG }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import os
 
-      - name: Create changelog state directory
-        if: steps.sources.outputs.changelog_found == 'true' && steps.cache_changelog.outputs.cache-hit != 'true'
-        run: mkdir -p .state/changelog
+          with open("sources.json", encoding="utf-8") as f:
+              data = json.load(f)
 
-      - name: Send changelog
-        if: steps.sources.outputs.changelog_found == 'true' && steps.cache_changelog.outputs.cache-hit != 'true'
-   
+          item = data.get("changelog")
+
+          if item and item.get("found"):
+              state = ".state-changelog"
+
+              old = ""
+              if os.path.exists(state):
+                  old = open(state).read().strip()
+
+              current = item["id"]
+
+              if current != old:
+                  subprocess.run(
+                      ["python3", "send.py", "changelog"],
+                      check=True
+                  )
+
+                  open(state, "w").write(current)
+          PY
+
+      # ============================================================
+      # PATCH NOTES
+      # ============================================================
+      - name: Send Patch Notes
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_PATCH_NOTES }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import os
+
+          with open("sources.json", encoding="utf-8") as f:
+              data = json.load(f)
+
+          item = data.get("patch_notes")
+
+          if item and item.get("found"):
+              state = ".state-patch"
+
+              old = ""
+              if os.path.exists(state):
+                  old = open(state).read().strip()
+
+              current = item["id"]
+
+              if current != old:
+                  subprocess.run(
+                      ["python3", "send.py", "patch_notes"],
+                      check=True
+                  )
+
+                  open(state, "w").write(current)
+          PY
+
+      # ============================================================
+      # DEVELOPER NEWS
+      # ============================================================
+      - name: Send Developer News
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_DEVELOPER_NEWS }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import os
+
+          with open("sources.json", encoding="utf-8") as f:
+              data = json.load(f)
+
+          item = data.get("developer_news")
+
+          if item and item.get("found"):
+              state = ".state-developer-news"
+
+              old = ""
+              if os.path.exists(state):
+                  old = open(state).read().strip()
+
+              current = item["id"]
+
+              if current != old:
+                  subprocess.run(
+                      ["python3", "send.py", "developer_news"],
+                      check=True
+                  )
+
+                  open(state, "w").write(current)
+          PY
+
+      # ============================================================
+      # API
+      # ============================================================
+      - name: Send API Update
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_API }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import os
+
+          with open("sources.json", encoding="utf-8") as f:
+              data = json.load(f)
+
+          item = data.get("api")
+
+          if item and item.get("found"):
+              state = ".state-api"
+
+              old = ""
+              if os.path.exists(state):
+                  old = open(state).read().strip()
+
+              current = item["id"]
+
+              if current != old:
+                  subprocess.run(
+                      ["python3", "send.py", "api"],
+                      check=True
+                  )
+
+                  open(state, "w").write(current)
+          PY
+
+      # ============================================================
+      # DOCS
+      # ============================================================
+      - name: Send Docs Update
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_DOCS }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import os
+
+          with open("sources.json", encoding="utf-8") as f:
+              data = json.load(f)
+
+          item = data.get("docs")
+
+          if item and item.get("found"):
+              state = ".state-docs"
+
+              old = ""
+              if os.path.exists(state):
+                  old = open(state).read().strip()
+
+              current = item["id"]
+
+              if current != old:
+                  subprocess.run(
+                      ["python3", "send.py
