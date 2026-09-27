@@ -18,11 +18,11 @@ jobs:
         uses: actions/cache@v6
         with:
           path: .discord-state
-          key: discord-news-${{ github.run_id }}
+          key: discord-news-state-${{ github.run_id }}
           restore-keys: |
-            discord-news-
+            discord-news-state-
 
-      - name: Fetch official Discord updates and send
+      - name: Fetch official Discord updates
         env:
           WEBHOOK_API: ${{ secrets.WEBHOOK_API }}
           WEBHOOK_BREAKING: ${{ secrets.WEBHOOK_BREAKING }}
@@ -34,7 +34,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          python3 - <<'PY'
+          python3 <<'PY'
           import os
           import re
           import json
@@ -44,541 +44,479 @@ jobs:
           import urllib.parse
           from pathlib import Path
           from html import unescape
-          from html.parser import HTMLParser
 
-          STATE_DIR = Path(".discord-state")
-          STATE_DIR.mkdir(parents=True, exist_ok=True)
+          STATE = Path(".discord-state")
+          STATE.mkdir(exist_ok=True)
 
           HEADERS = {
               "User-Agent": "Mozilla/5.0 (DiscordDocsNews/3.0)",
-              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+              "Accept": "text/html,application/xhtml+xml,*/*",
           }
-
-          BLOG_TAGS = {
-              "patch_notes": (
-                  "WEBHOOK_PATCH_NOTES",
-                  "https://discord.com/tags/patch-notes",
-                  "patch notes",
-              ),
-              "changelog": (
-                  "WEBHOOK_CHANGELOG",
-                  "https://discord.com/tags/changelog",
-                  "changelog",
-              ),
-          }
-
-          NEWSLETTER_URL = "https://discord.com/developers/developer-newsletter"
-          DEVELOPER_CHANGELOG_URL = "https://docs.discord.com/developers/change-log"
 
 
           def fetch(url):
-              request = urllib.request.Request(url, headers=HEADERS)
+              request = urllib.request.Request(
+                  url,
+                  headers=HEADERS
+              )
 
               try:
-                  with urllib.request.urlopen(request, timeout=45) as response:
-                      return response.read().decode("utf-8", errors="replace")
+                  with urllib.request.urlopen(
+                      request,
+                      timeout=45
+                  ) as response:
+                      return response.read().decode(
+                          "utf-8",
+                          "replace"
+                      )
+
               except urllib.error.HTTPError as error:
-                  body = error.read().decode("utf-8", errors="replace")
+                  body = error.read().decode(
+                      "utf-8",
+                      "replace"
+                  )
+
                   raise RuntimeError(
-                      f"HTTP {error.code} while fetching {url}: {body[:500]}"
+                      f"HTTP {error.code} fetching {url}: "
+                      f"{body[:500]}"
                   )
 
 
           def clean(value):
               value = unescape(value or "")
-              value = re.sub(r"\s+", " ", value)
+
+              value = re.sub(
+                  r"<script\b[^>]*>.*?</script>",
+                  " ",
+                  value,
+                  flags=re.I | re.S
+              )
+
+              value = re.sub(
+                  r"<style\b[^>]*>.*?</style>",
+                  " ",
+                  value,
+                  flags=re.I | re.S
+              )
+
+              value = re.sub(
+                  r"<svg\b[^>]*>.*?</svg>",
+                  " ",
+                  value,
+                  flags=re.I | re.S
+              )
+
+              value = re.sub(
+                  r"<[^>]+>",
+                  " ",
+                  value
+              )
+
+              value = re.sub(
+                  r"\s+",
+                  " ",
+                  value
+              )
+
               return value.strip()
 
 
-          class LinkParser(HTMLParser):
-              def __init__(self):
-                  super().__init__()
-                  self.links = []
-                  self.href = None
-                  self.text = []
-
-              def handle_starttag(self, tag, attrs):
-                  if tag.lower() == "a":
-                      data = dict(attrs)
-                      self.href = data.get("href")
-                      self.text = []
-
-              def handle_data(self, data):
-                  if self.href is not None:
-                      self.text.append(data)
-
-              def handle_endtag(self, tag):
-                  if tag.lower() == "a" and self.href is not None:
-                      title = clean(" ".join(self.text))
-
-                      if self.href and title:
-                          self.links.append((self.href, title))
-
-                      self.href = None
-                      self.text = []
-
-
           def get_links(html, base_url):
-              parser = LinkParser()
-              parser.feed(html)
+              results = []
 
-              result = []
+              pattern = re.compile(
+                  r'<a\b[^>]*href=["\']([^"\']+)["\'][^>]*>'
+                  r'(.*?)'
+                  r'</a>',
+                  re.I | re.S
+              )
 
-              for href, title in parser.links:
-                  url = urllib.parse.urljoin(base_url, href)
-                  result.append((url, title))
+              for href, content in pattern.findall(html):
+                  title = clean(content)
 
-              return result
+                  if not title:
+                      continue
+
+                  url = urllib.parse.urljoin(
+                      base_url,
+                      unescape(href)
+                  )
+
+                  if not url.startswith(
+                      "https://discord.com/"
+                  ):
+                      continue
+
+                  results.append(
+                      (url, title)
+                  )
+
+              return results
 
 
-          class ArticleParser(HTMLParser):
-              BLOCKS = {
-                  "p",
-                  "h1",
-                  "h2",
-                  "h3",
-                  "h4",
-                  "h5",
-                  "h6",
-                  "li",
-                  "blockquote",
-              }
+          def get_meta(html, name):
+              patterns = [
+                  rf'<meta\b[^>]*(?:property|name)=["\']{re.escape(name)}["\'][^>]*content=["\']([^"\']+)["\']',
+                  rf'<meta\b[^>]*content=["\']([^"\']+)["\'][^>]*(?:property|name)=["\']{re.escape(name)}["\']',
+              ]
 
-              def __init__(self):
-                  super().__init__()
+              for pattern in patterns:
+                  match = re.search(
+                      pattern,
+                      html,
+                      flags=re.I
+                  )
 
-                  self.article_depth = 0
-                  self.main_depth = 0
-                  self.skip_depth = 0
+                  if match:
+                      return unescape(
+                          match.group(1)
+                      ).strip()
 
-                  self.current_tag = None
-                  self.current_text = []
-                  self.blocks = []
-
-                  self.images = []
-
-              def inside_content(self):
-                  return self.article_depth > 0 or self.main_depth > 0
-
-              def handle_starttag(self, tag, attrs):
-                  tag = tag.lower()
-                  data = dict(attrs)
-
-                  if tag in ("script", "style", "noscript"):
-                      self.skip_depth += 1
-                      return
-
-                  if self.skip_depth:
-                      return
-
-                  if tag == "article":
-                      self.article_depth += 1
-
-                  elif tag == "main":
-                      self.main_depth += 1
-
-                  elif tag == "img" and self.inside_content():
-                      src = (
-                          data.get("src")
-                          or data.get("data-src")
-                          or data.get("data-lazy-src")
-                      )
-
-                      if src:
-                          self.images.append(src)
-
-                  if tag in self.BLOCKS and self.inside_content():
-                      if self.current_tag is None:
-                          self.current_tag = tag
-                          self.current_text = []
-
-              def handle_data(self, data):
-                  if self.skip_depth:
-                      return
-
-                  if self.current_tag is not None:
-                      self.current_text.append(data)
-
-              def handle_endtag(self, tag):
-                  tag = tag.lower()
-
-                  if tag in ("script", "style", "noscript"):
-                      self.skip_depth = max(0, self.skip_depth - 1)
-                      return
-
-                  if self.skip_depth:
-                      return
-
-                  if tag in self.BLOCKS and self.current_tag == tag:
-                      text = clean(" ".join(self.current_text))
-
-                      if text:
-                          self.blocks.append((tag, text))
-
-                      self.current_tag = None
-                      self.current_text = []
-
-                  if tag == "article":
-                      self.article_depth = max(0, self.article_depth - 1)
-
-                  elif tag == "main":
-                      self.main_depth = max(0, self.main_depth - 1)
+              return ""
 
 
           def extract_article(url):
               html = fetch(url)
 
-              parser = ArticleParser()
-              parser.feed(html)
+              title = get_meta(
+                  html,
+                  "og:title"
+              )
 
-              blocks = parser.blocks
+              if not title:
+                  match = re.search(
+                      r"<title[^>]*>(.*?)</title>",
+                      html,
+                      flags=re.I | re.S
+                  )
 
-              title = ""
-
-              for tag, text in blocks:
-                  if tag == "h1":
-                      title = text
-                      break
+                  if match:
+                      title = clean(
+                          match.group(1)
+                      )
 
               if not title:
                   title = "Discord Update"
 
-              date_match = re.search(
-                  r"\b(?:January|February|March|April|May|June|"
-                  r"July|August|September|October|November|December)"
-                  r"\s+\d{1,2},\s+20\d{2}\b",
+              date = get_meta(
                   html,
-                  re.I,
+                  "article:published_time"
               )
 
-              date = date_match.group(0) if date_match else ""
+              if date:
+                  date = date[:10]
 
-              paragraphs = []
-              seen = set()
+              if not date:
+                  match = re.search(
+                      r"\b(?:January|February|March|April|May|June|"
+                      r"July|August|September|October|November|December)"
+                      r"\s+\d{1,2},\s+20\d{2}\b",
+                      html,
+                      flags=re.I
+                  )
 
-              for tag, text in blocks:
-                  if not text:
+                  if match:
+                      date = match.group(0)
+
+              article_match = re.search(
+                  r"<article\b[^>]*>(.*?)</article>",
+                  html,
+                  flags=re.I | re.S
+              )
+
+              if not article_match:
+                  article_match = re.search(
+                      r"<main\b[^>]*>(.*?)</main>",
+                      html,
+                      flags=re.I | re.S
+                  )
+
+              if article_match:
+                  body = article_match.group(1)
+              else:
+                  body = html
+
+              body = re.sub(
+                  r"<script\b[^>]*>.*?</script>",
+                  " ",
+                  body,
+                  flags=re.I | re.S
+              )
+
+              body = re.sub(
+                  r"<style\b[^>]*>.*?</style>",
+                  " ",
+                  body,
+                  flags=re.I | re.S
+              )
+
+              body = re.sub(
+                  r"<(nav|header|footer)\b[^>]*>.*?</\1>",
+                  " ",
+                  body,
+                  flags=re.I | re.S
+              )
+
+              body = re.sub(
+                  r"</(h[1-6]|p|li|blockquote|pre|div|section)>",
+                  "\n\n",
+                  body,
+                  flags=re.I
+              )
+
+              body = re.sub(
+                  r"<li\b[^>]*>",
+                  "- ",
+                  body,
+                  flags=re.I
+              )
+
+              body = re.sub(
+                  r"<[^>]+>",
+                  " ",
+                  body
+              )
+
+              body = unescape(body)
+
+              lines = []
+
+              for line in body.splitlines():
+                  line = re.sub(
+                      r"[ \t]+",
+                      " ",
+                      line
+                  ).strip()
+
+                  if not line:
                       continue
 
-                  if text == title:
+                  if lines and line == lines[-1]:
                       continue
 
-                  if date and text == date:
-                      continue
+                  lines.append(line)
 
-                  if text in seen:
-                      continue
+              content = "\n\n".join(
+                  lines
+              ).strip()
 
-                  seen.add(text)
-
-                  if tag == "li":
-                      paragraphs.append(f"- {text}")
-                  elif tag == "blockquote":
-                      paragraphs.append(f"> {text}")
-                  elif tag.startswith("h"):
-                      paragraphs.append(f"## {text}")
-                  else:
-                      paragraphs.append(text)
-
-              content = "\n\n".join(paragraphs).strip()
+              if title:
+                  content = re.sub(
+                      r"^" + re.escape(title) + r"\s*",
+                      "",
+                      content,
+                      count=1,
+                      flags=re.I
+                  ).strip()
 
               images = []
 
-              for image in parser.images:
-                  image = urllib.parse.urljoin(url, image)
-
-                  if not image.startswith("http"):
+              for image in [
+                  get_meta(html, "og:image"),
+                  get_meta(html, "twitter:image"),
+              ]:
+                  if not image:
                       continue
 
-                  if image.startswith("data:"):
-                      continue
-
-                  if image.lower().endswith(".svg"):
-                      continue
+                  image = urllib.parse.urljoin(
+                      url,
+                      image
+                  )
 
                   if image not in images:
                       images.append(image)
-
-                  if len(images) >= 4:
-                      break
 
               return {
                   "title": title,
                   "date": date,
                   "url": url,
                   "content": content,
-                  "images": images,
+                  "images": images[:3],
               }
 
 
-          def find_blog_update(tag_url, keyword):
+          def latest_from_tag(tag_url, phrase):
               html = fetch(tag_url)
-              links = get_links(html, tag_url)
 
               candidates = []
 
-              for url, title in links:
+              for url, title in get_links(
+                  html,
+                  tag_url
+              ):
                   if "/blog/" not in url:
                       continue
 
-                  if keyword.lower() in title.lower():
-                      candidates.append((url, title))
+                  if phrase.lower() not in title.lower():
+                      continue
+
+                  candidates.append(
+                      (url, title)
+                  )
 
               if not candidates:
                   raise RuntimeError(
-                      f"No official Discord article found at {tag_url}"
+                      f"No '{phrase}' article found at {tag_url}"
                   )
 
-              return extract_article(candidates[0][0])
-
-
-          def find_latest_newsletter():
-              html = fetch(NEWSLETTER_URL)
-              links = get_links(html, NEWSLETTER_URL)
-
-              for url, title in links:
-                  if "/developer-newsletter/" in url:
-                      return extract_article(url)
-
-              raise RuntimeError(
-                  "No official Discord Developer Newsletter article found"
+              return extract_article(
+                  candidates[0][0]
               )
 
 
-          class TextParser(HTMLParser):
-              BLOCKS = {
-                  "h1",
-                  "h2",
-                  "h3",
-                  "h4",
-                  "h5",
-                  "h6",
-                  "p",
-                  "li",
-                  "button",
-              }
+          def latest_newsletter():
+              url = (
+                  "https://discord.com/"
+                  "developers/developer-newsletter"
+              )
 
-              def __init__(self):
-                  super().__init__()
-                  self.skip = 0
-                  self.current = None
-                  self.buffer = []
-                  self.lines = []
+              html = fetch(url)
 
-              def handle_starttag(self, tag, attrs):
-                  tag = tag.lower()
+              for article_url, title in get_links(
+                  html,
+                  url
+              ):
+                  if "/developer-newsletter/" not in article_url:
+                      continue
 
-                  if tag in ("script", "style", "noscript"):
-                      self.skip += 1
-                      return
+                  return extract_article(
+                      article_url
+                  )
 
-                  if self.skip:
-                      return
-
-                  if tag in self.BLOCKS:
-                      self.current = tag
-                      self.buffer = []
-
-              def handle_data(self, data):
-                  if self.skip:
-                      return
-
-                  if self.current is not None:
-                      self.buffer.append(data)
-
-              def handle_endtag(self, tag):
-                  tag = tag.lower()
-
-                  if tag in ("script", "style", "noscript"):
-                      self.skip = max(0, self.skip - 1)
-                      return
-
-                  if self.skip:
-                      return
-
-                  if self.current == tag:
-                      text = clean(" ".join(self.buffer))
-
-                      if text:
-                          self.lines.append(text)
-
-                      self.current = None
-                      self.buffer = []
+              raise RuntimeError(
+                  "No developer newsletter found"
+              )
 
 
-          def parse_developer_changelog():
-              html = fetch(DEVELOPER_CHANGELOG_URL)
+          def developer_changelog():
+              url = (
+                  "https://discord.com/"
+                  "developers/docs/change-log"
+              )
 
-              parser = TextParser()
-              parser.feed(html)
+              html = fetch(url)
+
+              title = "Discord Developer Changelog"
+
+              body_match = re.search(
+                  r"<main\b[^>]*>(.*?)</main>",
+                  html,
+                  flags=re.I | re.S
+              )
+
+              if body_match:
+                  body = body_match.group(1)
+              else:
+                  body = html
+
+              body = re.sub(
+                  r"<script\b[^>]*>.*?</script>",
+                  " ",
+                  body,
+                  flags=re.I | re.S
+              )
+
+              body = re.sub(
+                  r"<style\b[^>]*>.*?</style>",
+                  " ",
+                  body,
+                  flags=re.I | re.S
+              )
+
+              body = re.sub(
+                  r"</(h[1-6]|p|li|blockquote|pre|div|section|article)>",
+                  "\n\n",
+                  body,
+                  flags=re.I
+              )
+
+              body = re.sub(
+                  r"<li\b[^>]*>",
+                  "- ",
+                  body,
+                  flags=re.I
+              )
+
+              body = re.sub(
+                  r"<[^>]+>",
+                  " ",
+                  body
+              )
+
+              body = unescape(body)
 
               lines = []
 
-              for line in parser.lines:
-                  if line not in lines:
-                      lines.append(line)
-
-              date_pattern = re.compile(
-                  r"^(January|February|March|April|May|June|July|"
-                  r"August|September|October|November|December)"
-                  r"\s+\d{1,2},\s+20\d{2}$",
-                  re.I,
-              )
-
-              positions = []
-
-              for index, line in enumerate(lines):
-                  if date_pattern.match(line):
-                      positions.append(index)
-
-              entries = []
-
-              for pos_index, start in enumerate(positions):
-                  end = (
-                      positions[pos_index + 1]
-                      if pos_index + 1 < len(positions)
-                      else len(lines)
-                  )
-
-                  chunk = lines[start:end]
-
-                  if len(chunk) < 3:
-                      continue
-
-                  date = chunk[0]
-
-                  category = ""
-                  title = ""
-                  body_start = 1
-
-                  for i in range(1, min(len(chunk), 8)):
-                      value = chunk[i]
-
-                      if value in {
-                          "HTTP API",
-                          "HTTP API Breaking Change",
-                          "Discord Social SDK",
-                          "Discord Social SDK HTTP API",
-                          "Gateway",
-                          "Gateway Activities",
-                          "Interactions",
-                          "Components",
-                          "Documentation",
-                          "Breaking Change",
-                      }:
-                          category = value
-                          body_start = i + 1
-                          break
-
-                  if body_start < len(chunk):
-                      title = chunk[body_start]
-                      body_start += 1
-
-                  body = "\n\n".join(
-                      chunk[body_start:]
+              for line in body.splitlines():
+                  line = re.sub(
+                      r"[ \t]+",
+                      " ",
+                      line
                   ).strip()
 
-                  if not title:
-                      continue
+                  if line:
+                      lines.append(line)
 
-                  entries.append({
-                      "date": date,
-                      "category": category,
-                      "title": title,
-                      "content": body,
-                  })
+              content = "\n\n".join(
+                  lines
+              ).strip()
 
-              return entries
-
-
-          def find_developer_update(entries, kind):
-              for entry in entries:
-                  category = entry["category"].lower()
-                  title = entry["title"].lower()
-                  content = entry["content"].lower()
-
-                  if kind == "breaking":
-                      if (
-                          "breaking change" in category
-                          or "breaking change" in title
-                      ):
-                          return entry
-
-                  elif kind == "api":
-                      if (
-                          "http api" in category
-                          and "breaking change" not in category
-                      ):
-                          return entry
-
-                  elif kind == "social_sdk":
-                      if "social sdk" in category:
-                          return entry
-
-                  elif kind == "docs":
-                      if (
-                          "documentation" in category
-                          or "documentation" in title
-                          or "developer resources" in content
-                      ):
-                          return entry
-
-              return None
-
-
-          def make_item(entry):
               return {
-                  "title": entry["title"],
-                  "date": entry["date"],
-                  "url": DEVELOPER_CHANGELOG_URL,
-                  "content": entry["content"],
+                  "title": title,
+                  "date": "",
+                  "url": url,
+                  "content": content,
                   "images": [],
               }
 
 
-          def make_id(item):
-              raw = (
-                  item["url"]
-                  + "|"
-                  + item["title"]
-                  + "|"
-                  + item.get("date", "")
-                  + "|"
-                  + item.get("content", "")
+          def find_section(item, keywords):
+              content = item["content"]
+
+              lower = content.lower()
+
+              positions = []
+
+              for keyword in keywords:
+                  position = lower.find(
+                      keyword.lower()
+                  )
+
+                  if position >= 0:
+                      positions.append(
+                          position
+                      )
+
+              if not positions:
+                  return None
+
+              position = min(positions)
+
+              start = max(
+                  0,
+                  position - 700
               )
 
-              return hashlib.sha256(
-                  raw.encode("utf-8")
-              ).hexdigest()
-
-
-          def state_path(category):
-              return STATE_DIR / f"{category}.state"
-
-
-          def get_state(category):
-              path = state_path(category)
-
-              if not path.exists():
-                  return ""
-
-              return path.read_text(
-                  encoding="utf-8"
-              ).strip()
-
-
-          def set_state(category, value):
-              state_path(category).write_text(
-                  value,
-                  encoding="utf-8"
+              end = min(
+                  len(content),
+                  position + 3600
               )
 
+              section = content[start:end].strip()
 
-          def split_text(text, limit=3500):
-              if not text:
-                  return [""]
+              return {
+                  "title": item["title"],
+                  "date": item["date"],
+                  "url": item["url"],
+                  "content": section,
+                  "images": item["images"],
+              }
 
-              paragraphs = text.split("\n\n")
+
+          def split_content(content, limit=3600):
+              paragraphs = content.split(
+                  "\n\n"
+              )
 
               chunks = []
               current = ""
@@ -600,10 +538,16 @@ jobs:
                       continue
 
                   if current:
-                      chunks.append(current)
+                      chunks.append(
+                          current
+                      )
 
                   while len(paragraph) > limit:
-                      cut = paragraph.rfind(" ", 0, limit)
+                      cut = paragraph.rfind(
+                          " ",
+                          0,
+                          limit
+                      )
 
                       if cut < 500:
                           cut = limit
@@ -612,67 +556,132 @@ jobs:
                           paragraph[:cut].strip()
                       )
 
-                      paragraph = paragraph[cut:].strip()
+                      paragraph = paragraph[
+                          cut:
+                      ].strip()
 
                   current = paragraph
 
               if current:
-                  chunks.append(current)
+                  chunks.append(
+                      current
+                  )
 
               return chunks or [""]
 
 
-          def build_payload(item, text, index, total):
-              components = []
+          def get_state(category):
+              path = STATE / (
+                  f"{category}.state"
+              )
 
-              if index == 0:
-                  for image in item.get("images", []):
-                      components.append({
-                          "type": 12,
-                          "items": [
-                              {
-                                  "type": 1,
-                                  "media": {
-                                      "url": image
-                                  }
-                              }
-                          ]
-                      })
+              if not path.exists():
+                  return ""
 
-              title = item["title"]
+              return path.read_text(
+                  encoding="utf-8"
+              ).strip()
 
-              if total > 1:
-                  title = (
-                      f"{title}\n"
-                      f"Part {index + 1}/{total}"
+
+          def save_state(category, value):
+              path = STATE / (
+                  f"{category}.state"
+              )
+
+              path.write_text(
+                  value,
+                  encoding="utf-8"
+              )
+
+
+          def send(category, item, webhook_name):
+              webhook = os.environ.get(
+                  webhook_name,
+                  ""
+              ).strip()
+
+              if not webhook:
+                  raise RuntimeError(
+                      f"{webhook_name} is empty"
                   )
 
-              components.append({
-                  "type": 10,
-                  "content": f"# {title}",
-              })
+              identity = (
+                  item["url"]
+                  + "|"
+                  + item["title"]
+                  + "|"
+                  + item["date"]
+                  + "|"
+                  + item["content"]
+              )
 
-              if item.get("date"):
+              update_id = hashlib.sha256(
+                  identity.encode("utf-8")
+              ).hexdigest()
+
+              if get_state(category) == update_id:
+                  print(
+                      f"{category}: already sent"
+                  )
+                  return
+
+              chunks = split_content(
+                  item["content"]
+              )
+
+              print(
+                  f"{category}: "
+                  f"{len(chunks)} message(s)"
+              )
+
+              for index, chunk in enumerate(
+                  chunks
+              ):
+                  components = []
+
+                  if index == 0:
+                      for image in item["images"][:1]:
+                          components.append({
+                              "type": 12,
+                              "items": [
+                                  {
+                                      "type": 1,
+                                      "media": {
+                                          "url": image
+                                      }
+                                  }
+                              ]
+                          })
+
                   components.append({
                       "type": 10,
-                      "content": f"**Published:** {item['date']}",
+                      "content": (
+                          f"# {item['title']}"
+                      )
                   })
 
-              components.append({
-                  "type": 14,
-                  "spacing": 1,
-              })
+                  if item["date"]:
+                      components.append({
+                          "type": 10,
+                          "content": (
+                              f"**Published:** "
+                              f"{item['date']}"
+                          )
+                      })
 
-              if text:
-                  components.append({
-                      "type": 10,
-                      "content": text,
-                  })
-
-              if index == total - 1:
                   components.append({
                       "type": 14,
-                      "spacing": 1,
+                      "spacing": 1
+                  })
+
+                  components.append({
+                      "type": 10,
+                      "content": chunk
+                  })
+
+                  components.append({
+                      "type": 14,
+                      "spacing": 1
                   })
 
                   components.append({
@@ -681,6 +690,63 @@ jobs:
                           {
                               "type": 2,
                               "style": 5,
-                              "label": "View Source",
-                              "url": item["url"],
-   
+                              "label": (
+                                  "View Source"
+                              ),
+                              "url": item["url"]
+                          }
+                      ]
+                  })
+
+                  payload = {
+                      "flags": 32768,
+                      "components": [
+                          {
+                              "type": 17,
+                              "components": components
+                          }
+                      ]
+                  }
+
+                  data = json.dumps(
+                      payload,
+                      ensure_ascii=False
+                  ).encode("utf-8")
+
+                  request = urllib.request.Request(
+                      webhook
+                      + "?with_components=true&wait=true",
+                      data=data,
+                      headers={
+                          "Content-Type":
+                              "application/json",
+                          "User-Agent":
+                              "DiscordDocsNews/3.0",
+                      },
+                      method="POST"
+                  )
+
+                  try:
+                      with urllib.request.urlopen(
+                          request,
+                          timeout=45
+                      ) as response:
+                          response.read()
+
+                          print(
+                              f"{category}: "
+                              f"HTTP {response.status} "
+                              f"part "
+                              f"{index + 1}/"
+                              f"{len(chunks)}"
+                          )
+
+                  except urllib.error.HTTPError as error:
+                      body = error.read().decode(
+                          "utf-8",
+                          "replace"
+                      )
+
+                      raise RuntimeError(
+                          f"{category}: Discord HTTP "
+       
