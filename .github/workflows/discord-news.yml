@@ -2,26 +2,37 @@ name: Discord Official News
 
 on:
   workflow_dispatch:
+    inputs:
+      force_send:
+        description: "Send the latest update immediately"
+        required: false
+        default: true
+        type: boolean
+
   schedule:
     - cron: "*/15 * * * *"
 
+permissions:
+  contents: read
+
 jobs:
   discord-news:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Restore update state
+      - name: Restore state
         uses: actions/cache@v6
         with:
           path: .discord-state
-          key: discord-news-state-${{ github.run_id }}
+          key: discord-news-${{ github.run_id }}
           restore-keys: |
-            discord-news-state-
+            discord-news-
 
-      - name: Discover official updates
+      - name: Discover latest official updates
         run: |
           cat > discover.py <<'PY'
           import json
@@ -30,51 +41,79 @@ jobs:
           import urllib.request
           import urllib.parse
 
-          UA = "DiscordDocsNews/3.0"
+          UA = "DiscordDocsNews/4.0"
 
           def get(url):
               req = urllib.request.Request(
                   url,
-                  headers={"User-Agent": UA}
+                  headers={
+                      "User-Agent": UA,
+                      "Accept": "text/html,application/json"
+                  }
               )
-              with urllib.request.urlopen(req, timeout=30) as r:
-                  return r.read().decode("utf-8", "ignore")
+
+              with urllib.request.urlopen(
+                  req,
+                  timeout=30
+              ) as response:
+                  return response.read().decode(
+                      "utf-8",
+                      "ignore"
+                  )
 
           def clean(text):
-              text = html.unescape(text or "")
+              text = html.unescape(
+                  text or ""
+              )
+
               text = re.sub(
                   r"<script.*?</script>",
                   " ",
                   text,
                   flags=re.S | re.I
               )
+
               text = re.sub(
                   r"<style.*?</style>",
                   " ",
                   text,
                   flags=re.S | re.I
               )
+
               text = re.sub(
                   r"<[^>]+>",
                   " ",
                   text
               )
+
               text = re.sub(
                   r"\s+",
                   " ",
                   text
               )
+
               return text.strip()
 
-          def page_info(url):
-              raw = get(url)
+          def absolute_url(url):
+              if not url:
+                  return ""
 
-              title = ""
-              image = ""
+              url = html.unescape(
+                  url
+              ).strip()
 
+              if url.startswith("//"):
+                  return "https:" + url
+
+              if url.startswith("/"):
+                  return "https://discord.com" + url
+
+              return url
+
+          def extract_meta(raw, name):
               patterns = [
-                  r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)',
-                  r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:title["\']'
+                  rf'<meta[^>]+property=["\']{re.escape(name)}["\'][^>]+content=["\']([^"\']+)',
+                  rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']{re.escape(name)}["\']'
               ]
 
               for pattern in patterns:
@@ -83,11 +122,31 @@ jobs:
                       raw,
                       re.I
                   )
+
                   if match:
-                      title = html.unescape(
+                      return html.unescape(
                           match.group(1)
                       ).strip()
-                      break
+
+              return ""
+
+          def page_info(url):
+              raw = get(url)
+
+              title = extract_meta(
+                  raw,
+                  "og:title"
+              )
+
+              image = extract_meta(
+                  raw,
+                  "og:image"
+              )
+
+              description = extract_meta(
+                  raw,
+                  "og:description"
+              )
 
               if not title:
                   match = re.search(
@@ -95,177 +154,293 @@ jobs:
                       raw,
                       re.S | re.I
                   )
+
                   if match:
                       title = clean(
                           match.group(1)
                       )
 
-              image_patterns = [
-                  r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)',
-                  r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']'
-              ]
-
-              for pattern in image_patterns:
-                  match = re.search(
-                      pattern,
-                      raw,
-                      re.I
+              if not description:
+                  description = clean(
+                      raw
                   )
-                  if match:
-                      image = html.unescape(
-                          match.group(1)
-                      ).strip()
-                      break
 
-              if image.startswith("/"):
-                  image = "https://discord.com" + image
+              image = absolute_url(
+                  image
+              )
 
               return {
                   "title": title,
                   "image": image,
-                  "text": clean(raw)
+                  "description": description
               }
 
-          def links(raw, pattern):
-              result = []
+          def find_blog_links(
+              raw,
+              prefix
+          ):
+              found = set()
 
-              for url in re.findall(
-                  pattern,
+              patterns = [
+                  rf'https://discord\.com/blog/{prefix}[^"\'<>\s?#]+',
+                  rf'/blog/{prefix}[^"\'<>\s?#]+'
+              ]
+
+              for pattern in patterns:
+                  for match in re.findall(
+                      pattern,
+                      raw,
+                      re.I
+                  ):
+                      url = absolute_url(
+                          match
+                      )
+
+                      url = url.rstrip(
+                          ".,);"
+                      )
+
+                      found.add(url)
+
+              return list(found)
+
+          def latest_blog_update():
+              raw = get(
+                  "https://discord.com/blog"
+              )
+
+              links = find_blog_links(
+                  raw,
+                  "discord-update-"
+              )
+
+              if not links:
+                  raise RuntimeError(
+                      "Could not find Discord changelog"
+                  )
+
+              dated = []
+
+              for url in links:
+                  match = re.search(
+                      r"discord-update-(\d{4}-\d{2}-\d{2})",
+                      url
+                  )
+
+                  if match:
+                      dated.append(
+                          (
+                              match.group(1),
+                              url
+                          )
+                      )
+
+              if dated:
+                  dated.sort(
+                      reverse=True
+                  )
+
+                  return dated[0][1]
+
+              return links[0]
+
+          def latest_patch_notes():
+              raw = get(
+                  "https://discord.com/tags/patch-notes"
+              )
+
+              links = find_blog_links(
+                  raw,
+                  "discord-patch-notes-"
+              )
+
+              if not links:
+                  raise RuntimeError(
+                      "Could not find Discord patch notes"
+                  )
+
+              dated = []
+
+              for url in links:
+                  match = re.search(
+                      r"discord-patch-notes-(\d{4}-\d{2}-\d{2})",
+                      url
+                  )
+
+                  if match:
+                      dated.append(
+                          (
+                              match.group(1),
+                              url
+                          )
+                      )
+
+              if dated:
+                  dated.sort(
+                      reverse=True
+                  )
+
+                  return dated[0][1]
+
+              return links[0]
+
+          def latest_newsletter():
+              raw = get(
+                  "https://discord.com/developers/developer-newsletter"
+              )
+
+              links = re.findall(
+                  r'https://discord\.com/developer-newsletter/[^"\'<>\s?#]+',
                   raw,
                   re.I
-              ):
-                  url = html.unescape(
+              )
+
+              links = list(
+                  dict.fromkeys(
+                      links
+                  )
+              )
+
+              if not links:
+                  raise RuntimeError(
+                      "Could not find developer newsletter"
+                  )
+
+              dated = []
+
+              for url in links:
+                  match = re.search(
+                      r"/developer-newsletter/(\d{4}-\d{2}-\d{2})",
                       url
-                  ).rstrip(".,)")
+                  )
 
-                  if url not in result:
-                      result.append(url)
+                  if match:
+                      dated.append(
+                          (
+                              match.group(1),
+                              url
+                          )
+                      )
 
-              return result
+              if dated:
+                  dated.sort(
+                      reverse=True
+                  )
+
+                  return dated[0][1]
+
+              return links[0]
 
           sources = {}
 
           try:
-              blog = get(
-                  "https://discord.com/blog"
+              url = latest_blog_update()
+              info = page_info(url)
+
+              sources["changelog"] = {
+                  "found": True,
+                  "title": info["title"][:250],
+                  "description": info["description"][:1800],
+                  "source": "Discord Blog",
+                  "type": "Changelog",
+                  "url": url,
+                  "image": info["image"],
+                  "id": url
+              }
+
+          except Exception as error:
+              print(
+                  "Changelog error:",
+                  error
               )
-          except Exception:
-              blog = ""
 
-          try:
-              patch = get(
-                  "https://discord.com/tags/patch-notes"
-              )
-          except Exception:
-              patch = ""
-
-          try:
-              newsletter = get(
-                  "https://discord.com/developers/developer-newsletter"
-              )
-          except Exception:
-              newsletter = ""
-
-          changelog_links = links(
-              blog,
-              r'https://discord\.com/blog/discord-update-[^"\'<>\s]+'
-          )
-
-          if changelog_links:
-              url = changelog_links[0]
-
-              try:
-                  info = page_info(url)
-
-                  sources["changelog"] = {
-                      "found": True,
-                      "title": info["title"][:250],
-                      "description": info["text"][:1800],
-                      "source": "Discord Blog",
-                      "type": "Changelog",
-                      "url": url,
-                      "image": info["image"]
-                  }
-              except Exception:
-                  sources["changelog"] = {
-                      "found": False
-                  }
-          else:
               sources["changelog"] = {
                   "found": False
               }
 
-          patch_links = links(
-              patch,
-              r'https://discord\.com/blog/discord-patch-notes-[^"\'<>\s]+'
-          )
+          try:
+              url = latest_patch_notes()
+              info = page_info(url)
 
-          if patch_links:
-              url = patch_links[0]
+              sources["patch_notes"] = {
+                  "found": True,
+                  "title": info["title"][:250],
+                  "description": info["description"][:1800],
+                  "source": "Discord Patch Notes",
+                  "type": "Patch Notes",
+                  "url": url,
+                  "image": info["image"],
+                  "id": url
+              }
 
-              try:
-                  info = page_info(url)
+          except Exception as error:
+              print(
+                  "Patch Notes error:",
+                  error
+              )
 
-                  sources["patch_notes"] = {
-                      "found": True,
-                      "title": info["title"][:250],
-                      "description": info["text"][:1800],
-                      "source": "Discord Patch Notes",
-                      "type": "Patch Notes",
-                      "url": url,
-                      "image": info["image"]
-                  }
-              except Exception:
-                  sources["patch_notes"] = {
-                      "found": False
-                  }
-          else:
               sources["patch_notes"] = {
                   "found": False
               }
 
-          newsletter_links = links(
-              newsletter,
-              r'https://discord\.com/developer-newsletter/[^"\'<>\s]+'
-          )
+          try:
+              url = latest_newsletter()
+              info = page_info(url)
 
-          if newsletter_links:
-              url = newsletter_links[0]
+              sources["developer_news"] = {
+                  "found": True,
+                  "title": info["title"][:250],
+                  "description": info["description"][:1800],
+                  "source": "Discord Developer Newsletter",
+                  "type": "Developer News",
+                  "url": url,
+                  "image": info["image"],
+                  "id": url
+              }
 
-              try:
-                  info = page_info(url)
+          except Exception as error:
+              print(
+                  "Developer News error:",
+                  error
+              )
 
-                  sources["developer_news"] = {
-                      "found": True,
-                      "title": info["title"][:250],
-                      "description": info["text"][:1800],
-                      "source": "Discord Developer Newsletter",
-                      "type": "Developer News",
-                      "url": url,
-                      "image": info["image"]
-                  }
-              except Exception:
-                  sources["developer_news"] = {
-                      "found": False
-                  }
-          else:
               sources["developer_news"] = {
                   "found": False
               }
 
           def github_get(url):
               try:
-                  return json.loads(
-                      get(url)
+                  req = urllib.request.Request(
+                      url,
+                      headers={
+                          "User-Agent": UA,
+                          "Accept": "application/vnd.github+json"
+                      }
                   )
-              except Exception:
+
+                  with urllib.request.urlopen(
+                      req,
+                      timeout=30
+                  ) as response:
+                      return json.loads(
+                          response.read().decode(
+                              "utf-8"
+                          )
+                      )
+
+              except Exception as error:
+                  print(
+                      "GitHub error:",
+                      error
+                  )
+
                   return None
 
-          def commits(
+          def get_commits(
               path=None,
               count=20
           ):
-              url = (
+              base = (
                   "https://api.github.com/repos/"
                   "discord/discord-api-docs/commits"
               )
@@ -277,25 +452,34 @@ jobs:
               if path:
                   params["path"] = path
 
-              url += "?" + urllib.parse.urlencode(
-                  params
+              url = (
+                  base
+                  + "?"
+                  + urllib.parse.urlencode(
+                      params
+                  )
               )
 
-              data = github_get(url)
+              data = github_get(
+                  url
+              )
 
-              if isinstance(data, list):
+              if isinstance(
+                  data,
+                  list
+              ):
                   return data
 
               return []
 
-          def commit_detail(sha):
+          def commit_details(sha):
               return github_get(
                   "https://api.github.com/repos/"
                   "discord/discord-api-docs/commits/"
                   + sha
               ) or {}
 
-          def make_commit_item(
+          def make_commit(
               commit,
               item_type
           ):
@@ -304,23 +488,33 @@ jobs:
                   ""
               )
 
-              commit_data = commit.get(
+              data = commit.get(
                   "commit",
                   {}
               )
 
-              message = commit_data.get(
+              message = data.get(
                   "message",
                   ""
               ).strip()
 
+              if not message:
+                  message = (
+                      "A new official Discord "
+                      "documentation update was published."
+                  )
+
               author = (
-                  commit_data
-                  .get("author", {})
-                  .get("name", "Discord")
+                  data.get(
+                      "author",
+                      {}
+                  ).get(
+                      "name",
+                      "Discord"
+                  )
               )
 
-              detail = commit_detail(
+              detail = commit_details(
                   sha
               )
 
@@ -343,12 +537,6 @@ jobs:
                   + sha
               )
 
-              if not message:
-                  message = (
-                      "A new official Discord API "
-                      "documentation update was published."
-                  )
-
               return {
                   "found": True,
                   "title": message.splitlines()[0][:250],
@@ -366,7 +554,7 @@ jobs:
                   "files": "\n".join(
                       filenames[:20]
                   ),
-                  "_id": sha
+                  "id": sha
               }
 
           api_paths = [
@@ -379,21 +567,21 @@ jobs:
               "developers/change-log.mdx"
           ]
 
-          api_commit = None
+          api_item = None
 
           for path in api_paths:
-              found = commits(
+              commits = get_commits(
                   path,
                   5
               )
 
-              if found:
-                  api_commit = found[0]
+              if commits:
+                  api_item = commits[0]
                   break
 
-          if api_commit:
-              sources["api"] = make_commit_item(
-                  api_commit,
+          if api_item:
+              sources["api"] = make_commit(
+                  api_item,
                   "API Update"
               )
           else:
@@ -401,19 +589,60 @@ jobs:
                   "found": False
               }
 
-          docs_commits = commits(
+          social_commits = []
+
+          for path in [
+              "resources/discord-social-sdk",
+              "developers/discord-social-sdk"
+          ]:
+              social_commits.extend(
+                  get_commits(
+                      path,
+                      10
+                  )
+              )
+
+          if social_commits:
+              social_commits.sort(
+                  key=lambda item:
+                      item.get(
+                          "commit",
+                          {}
+                      ).get(
+                          "author",
+                          {}
+                      ).get(
+                          "date",
+                          ""
+                      ),
+                  reverse=True
+              )
+
+              sources["social_sdk"] = make_commit(
+                  social_commits[0],
+                  "Social SDK"
+              )
+          else:
+              sources["social_sdk"] = {
+                  "found": False
+              }
+
+          docs_commits = get_commits(
               "developers",
-              20
+              30
           )
 
-          docs_commit = None
+          docs_item = None
 
           for commit in docs_commits:
               message = (
-                  commit
-                  .get("commit", {})
-                  .get("message", "")
-                  .lower()
+                  commit.get(
+                      "commit",
+                      {}
+                  ).get(
+                      "message",
+                      ""
+                  ).lower()
               )
 
               if not any(
@@ -426,12 +655,12 @@ jobs:
                       "removed"
                   ]
               ):
-                  docs_commit = commit
+                  docs_item = commit
                   break
 
-          if docs_commit:
-              sources["docs"] = make_commit_item(
-                  docs_commit,
+          if docs_item:
+              sources["docs"] = make_commit(
+                  docs_item,
                   "Documentation Update"
               )
           else:
@@ -439,50 +668,22 @@ jobs:
                   "found": False
               }
 
-          social_commits = []
-
-          for path in [
-              "resources/discord-social-sdk",
-              "developers/discord-social-sdk"
-          ]:
-              social_commits.extend(
-                  commits(
-                      path,
-                      10
-                  )
-              )
-
-          if social_commits:
-              social_commits.sort(
-                  key=lambda item:
-                      item.get("commit", {})
-                      .get("author", {})
-                      .get("date", ""),
-                  reverse=True
-              )
-
-              sources["social_sdk"] = make_commit_item(
-                  social_commits[0],
-                  "Social SDK"
-              )
-          else:
-              sources["social_sdk"] = {
-                  "found": False
-              }
-
-          all_commits = commits(
+          all_commits = get_commits(
               None,
               50
           )
 
-          breaking_commit = None
+          breaking_item = None
 
           for commit in all_commits:
               message = (
-                  commit
-                  .get("commit", {})
-                  .get("message", "")
-                  .lower()
+                  commit.get(
+                      "commit",
+                      {}
+                  ).get(
+                      "message",
+                      ""
+                  ).lower()
               )
 
               if any(
@@ -495,12 +696,12 @@ jobs:
                       "removed"
                   ]
               ):
-                  breaking_commit = commit
+                  breaking_item = commit
                   break
 
-          if breaking_commit:
-              sources["breaking"] = make_commit_item(
-                  breaking_commit,
+          if breaking_item:
+              sources["breaking"] = make_commit(
+                  breaking_item,
                   "Breaking Change"
               )
           else:
@@ -520,18 +721,39 @@ jobs:
                   indent=2
               )
 
+          print("")
+          print("===== DISCOVERED UPDATES =====")
+
+          for category, item in sources.items():
+              if item.get("found"):
+                  print(
+                      category,
+                      "->",
+                      item.get("title")
+                  )
+              else:
+                  print(
+                      category,
+                      "-> NOT FOUND"
+                  )
+
           print(
-              json.dumps(
-                  sources,
-                  ensure_ascii=False,
-                  indent=2
-              )
+              "=============================="
           )
           PY
 
           python3 discover.py
 
-      - name: Create Components V2 sender
+      - name: Send updates
+        env:
+          WEBHOOK_PATCH_NOTES: ${{ secrets.WEBHOOK_PATCH_NOTES }}
+          WEBHOOK_DEVELOPER_NEWS: ${{ secrets.WEBHOOK_DEVELOPER_NEWS }}
+          WEBHOOK_CHANGELOG: ${{ secrets.WEBHOOK_CHANGELOG }}
+          WEBHOOK_SOCIAL_SDK: ${{ secrets.WEBHOOK_SOCIAL_SDK }}
+          WEBHOOK_DOCS: ${{ secrets.WEBHOOK_DOCS }}
+          WEBHOOK_API: ${{ secrets.WEBHOOK_API }}
+          WEBHOOK_BREAKING: ${{ secrets.WEBHOOK_BREAKING }}
+          FORCE_SEND: ${{ github.event_name == 'workflow_dispatch' && inputs.force_send || false }}
         run: |
           cat > send.py <<'PY'
           import json
@@ -542,232 +764,19 @@ jobs:
           import urllib.error
 
           category = sys.argv[1]
-          webhook = os.environ["WEBHOOK_URL"]
-
-          with open(
-              "sources.json",
-              "r",
-              encoding="utf-8"
-          ) as file:
-              sources = json.load(file)
-
-          item = sources.get(
-              category
-          )
-
-          if not item or not item.get("found"):
-              print(
-                  f"No official update found for {category}"
-              )
-              sys.exit(0)
-
-          os.makedirs(
-              ".discord-state",
-              exist_ok=True
-          )
-
-          state_file = os.path.join(
-              ".discord-state",
-              f"{category}.state"
-          )
-
-          source_id = (
-              item.get("_id")
-              or item.get("url")
-              or item.get("title")
-          )
-
-          old_id = ""
-
-          if os.path.exists(
-              state_file
-          ):
-              with open(
-                  state_file,
-                  "r",
-                  encoding="utf-8"
-              ) as file:
-                  old_id = file.read().strip()
-
-          if old_id == source_id:
-              print(
-                  f"No new update for {category}"
-              )
-              sys.exit(0)
-
-          title = item.get(
-              "title",
-              "Official Discord Update"
-          )[:250]
-
-          description = item.get(
-              "description",
-              "An official Discord update was published."
-          )[:1800]
-
-          source = item.get(
-              "source",
-              "Discord"
-          )
-
-          item_type = item.get(
-              "type",
-              category
-          )
-
-          url = item.get(
-              "url",
+          webhook = os.environ.get(
+              "WEBHOOK_URL",
               ""
           )
 
-          image_url = item.get(
-              "image",
-              ""
+          force_send = (
+              os.environ.get(
+                  "FORCE_SEND",
+                  "false"
+              ).lower()
+              == "true"
           )
 
-          if not (
-              image_url.startswith(
-                  "https://"
-              )
-              or image_url.startswith(
-                  "http://"
-              )
-          ):
-              image_url = ""
-
-          info = (
-              f"**Source**\n"
-              f"{source}\n\n"
-              f"**Type**\n"
-              f"{item_type}"
-          )
-
-          if item.get("author"):
-              info += (
-                  "\n\n**Author**\n"
-                  + item["author"]
-              )
-
-          if item.get("commit"):
-              info += (
-                  "\n\n**Commit**\n"
-                  f"`{item['commit']}`"
-              )
-
-          if item.get("files"):
-              info += (
-                  "\n\n**Changed Files**\n"
-                  "```text\n"
-                  + item["files"][:700]
-                  + "\n```"
-              )
-
-          username = {
-              "patch_notes": "Discoɾd Patch Notes",
-              "developer_news": "Discoɾd Developer News",
-              "changelog": "Discoɾd Changelog",
-              "social_sdk": "Discoɾd Social SDK",
-              "docs": "Discoɾd Docs Updates",
-              "api": "Discoɾd API Updates",
-              "breaking": "Discoɾd Breaking Changes"
-          }.get(
-              category,
-              "Discoɾd Docs Updates"
-          )
-
-          components = []
-
-          container_components = []
-
-          if image_url:
-              container_components.append({
-                  "type": 12,
-                  "items": [
-                      {
-                          "media": {
-                              "url": image_url
-                          },
-                          "description": (
-                              f"{title} image"
-                          )[:1024]
-                      }
-                  ]
-              })
-
-          container_components.append({
-              "type": 14,
-              "divider": True,
-              "spacing": 1
-          })
-
-          container_components.append({
-              "type": 10,
-              "content": (
-                  f"# {title}\n\n"
-                  f"{description}"
-              )
-          })
-
-          container_components.append({
-              "type": 14,
-              "divider": True,
-              "spacing": 1
-          })
-
-          section = {
-              "type": 9,
-              "components": [
-                  {
-                      "type": 10,
-                      "content": info[:1800]
-                  }
-              ]
-          }
-
-          if image_url:
-              section["accessory"] = {
-                  "type": 11,
-                  "media": {
-                      "url": image_url
-                  },
-                  "description": (
-                      "Official update"
-                  )
-              }
-
-          container_components.append(
-              section
-          )
-
-          container_components.append({
-              "type": 14,
-              "divider": True,
-              "spacing": 1
-          })
-
-          container_components.append({
-              "type": 1,
-              "components": [
-                  {
-                      "type": 2,
-                      "style": 5,
-                      "label": "Open Official Update",
-                      "url": url
-                  }
-              ]
-          })
-
-          components.append({
-              "type": 17,
-              "accent_color": 5793266,
-              "components": container_components
-          })
-
-          payload = {
-              "username": username,
-              "flags": 32768,
-              "components": components
-          }
-
-          boundary = (
-              "----DiscordDocs"
+          if not webhook:
+              print(
+                  f"{category}: WEBHOOK_URL
