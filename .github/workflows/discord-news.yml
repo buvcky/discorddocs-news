@@ -5,9 +5,6 @@ on:
   schedule:
     - cron: "*/15 * * * *"
 
-permissions:
-  contents: read
-
 jobs:
   discord-news:
     runs-on: ubuntu-latest
@@ -17,302 +14,296 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Discover official updates
-        id: discover
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          python3 <<'PY'
+          cat > discover.py <<'PY'
           import json
           import re
-          import html
-          import hashlib
-          import os
           import urllib.request
-          from urllib.parse import urljoin
+          import urllib.error
 
-          UA = "DiscordDocsNews/1.0"
-
-          def get(url, github=False):
-              headers = {"User-Agent": UA}
-              if github:
-                  headers["Accept"] = "application/vnd.github+json"
-                  headers["Authorization"] = f"Bearer {os.environ['GITHUB_TOKEN']}"
-                  headers["X-GitHub-Api-Version"] = "2026-03-10"
-
-              req = urllib.request.Request(url, headers=headers)
-
+          def get(url):
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "DiscordDocsNews/1.0"
+                  }
+              )
               with urllib.request.urlopen(req, timeout=30) as r:
                   return r.read().decode("utf-8", "ignore")
 
-          def clean(s):
-              s = html.unescape(s or "")
-              s = re.sub(r"<[^>]+>", " ", s)
-              s = re.sub(r"\s+", " ", s)
-              return s.strip()
-
-          def meta(page, name):
-              patterns = [
-                  rf'<meta[^>]+property=["\']{re.escape(name)}["\'][^>]+content=["\'](.*?)["\']',
-                  rf'<meta[^>]+content=["\'](.*?)["\'][^>]+property=["\']{re.escape(name)}["\']'
-              ]
-
-              for p in patterns:
-                  m = re.search(p, page, re.I | re.S)
-                  if m:
-                      return clean(m.group(1))
-
-              return ""
-
-          def details(url):
+          def fetch(url):
               try:
-                  page = get(url)
+                  return get(url)
+              except Exception as e:
+                  print(f"Fetch failed: {url} -> {e}")
+                  return ""
 
-                  return {
-                      "title": (
-                          meta(page, "og:title")
-                          or meta(page, "twitter:title")
-                          or "Official Discord Update"
-                      ),
-                      "description": (
-                          meta(page, "og:description")
-                          or meta(page, "twitter:description")
-                          or meta(page, "description")
-                          or "An official update was published by Discord."
-                      ),
-                      "image": (
-                          meta(page, "og:image")
-                          or meta(page, "twitter:image")
-                      )
-                  }
+          def clean_html(text):
+              text = re.sub(r"<script.*?</script>", "", text, flags=re.S | re.I)
+              text = re.sub(r"<style.*?</style>", "", text, flags=re.S | re.I)
+              text = re.sub(r"<[^>]+>", " ", text)
+              text = re.sub(r"\s+", " ", text)
+              return text.strip()
 
-              except Exception:
-                  return {
-                      "title": "Official Discord Update",
-                      "description": "An official update was published by Discord.",
-                      "image": ""
-                  }
-
-          def find_link(page, pattern):
-              matches = []
-
-              for m in re.finditer(
-                  rf'href=["\'](https://discord\.com{pattern})["\']',
-                  page,
-                  re.I
-              ):
-                  matches.append(m.group(1))
-
-              for m in re.finditer(
-                  rf'href=["\']({pattern})["\']',
-                  page,
-                  re.I
-              ):
-                  matches.append(urljoin("https://discord.com", m.group(1)))
-
-              seen = set()
-
-              for url in matches:
-                  url = html.unescape(url)
-                  url = url.split("?")[0].rstrip("/")
-
-                  if url not in seen:
-                      seen.add(url)
-                      return url
-
-              return ""
-
-          def make_item(url, source, item_type):
-              d = details(url)
-
-              return {
-                  "found": True,
-                  "id": hashlib.sha256(url.encode()).hexdigest()[:32],
-                  "url": url,
-                  "title": d["title"][:250],
-                  "description": d["description"][:1800],
-                  "image": d["image"],
-                  "source": source,
-                  "type": item_type
-              }
+          def first_match(pattern, text):
+              m = re.search(pattern, text, re.I)
+              return m.group(1).strip() if m else ""
 
           sources = {}
 
-          # --------------------------------------------------
-          # Discord Changelog
-          # --------------------------------------------------
+          blog = fetch("https://discord.com/blog")
+          patch = fetch("https://discord.com/tags/patch-notes")
+          newsletter = fetch(
+              "https://discord.com/developers/developer-newsletter"
+          )
+
+          blog_text = clean_html(blog)
+          patch_text = clean_html(patch)
+          newsletter_text = clean_html(newsletter)
+
+          changelog_urls = re.findall(
+              r'https://discord\.com/blog/discord-update-[^"\'<>\s]+',
+              blog
+          )
+
+          if changelog_urls:
+              url = changelog_urls[0].rstrip(".,)")
+              page = clean_html(fetch(url))
+
+              title = first_match(
+                  r"<title[^>]*>(.*?)</title>",
+                  fetch(url)
+              )
+
+              if not title:
+                  title = "Discord Update"
+
+              title = re.sub(
+                  r"\s*[|–-]\s*Discord.*$",
+                  "",
+                  title,
+                  flags=re.I
+              ).strip()
+
+              description = page[:1600]
+
+              sources["changelog"] = {
+                  "found": True,
+                  "title": title[:250],
+                  "description": description,
+                  "source": "Discord Blog",
+                  "type": "Changelog",
+                  "url": url
+              }
+          else:
+              sources["changelog"] = {"found": False}
+
+          patch_urls = re.findall(
+              r'https://discord\.com/blog/discord-patch-notes-[^"\'<>\s]+',
+              patch
+          )
+
+          if patch_urls:
+              url = patch_urls[0].rstrip(".,)")
+              page_raw = fetch(url)
+              page = clean_html(page_raw)
+
+              title = first_match(
+                  r"<title[^>]*>(.*?)</title>",
+                  page_raw
+              )
+
+              if not title:
+                  title = "Discord Patch Notes"
+
+              title = re.sub(
+                  r"\s*[|–-]\s*Discord.*$",
+                  "",
+                  title,
+                  flags=re.I
+              ).strip()
+
+              sources["patch_notes"] = {
+                  "found": True,
+                  "title": title[:250],
+                  "description": page[:1600],
+                  "source": "Discord Patch Notes",
+                  "type": "Patch Notes",
+                  "url": url
+              }
+          else:
+              sources["patch_notes"] = {"found": False}
+
+          newsletter_urls = re.findall(
+              r'https://discord\.com/developer-newsletter/[^"\'<>\s]+',
+              newsletter
+          )
+
+          if newsletter_urls:
+              url = newsletter_urls[0].rstrip(".,)")
+              page_raw = fetch(url)
+              page = clean_html(page_raw)
+
+              title = first_match(
+                  r"<title[^>]*>(.*?)</title>",
+                  page_raw
+              )
+
+              if not title:
+                  title = "Discord Developer Newsletter"
+
+              title = re.sub(
+                  r"\s*[|–-]\s*Discord.*$",
+                  "",
+                  title,
+                  flags=re.I
+              ).strip()
+
+              sources["developer_news"] = {
+                  "found": True,
+                  "title": title[:250],
+                  "description": page[:1600],
+                  "source": "Discord Developer Newsletter",
+                  "type": "Developer News",
+                  "url": url
+              }
+          else:
+              sources["developer_news"] = {"found": False}
+
+          github_api = fetch(
+              "https://api.github.com/repos/discord/discord-api-docs/commits?per_page=1"
+          )
+
           try:
-              page = get("https://discord.com/blog")
+              commits = json.loads(github_api)
+          except Exception:
+              commits = []
 
-              url = find_link(
-                  page,
-                  r"/blog/discord-update-[^\"'#?]+"
-              )
-
-              if url:
-                  sources["changelog"] = make_item(
-                      url,
-                      "Discord Blog",
-                      "Changelog"
-                  )
-
-          except Exception as e:
-              print("Changelog error:", e)
-
-          # --------------------------------------------------
-          # Discord Patch Notes
-          # --------------------------------------------------
-          try:
-              page = get("https://discord.com/tags/patch-notes")
-
-              url = find_link(
-                  page,
-                  r"/blog/discord-patch-notes-[^\"'#?]+"
-              )
-
-              if url:
-                  sources["patch_notes"] = make_item(
-                      url,
-                      "Discord Patch Notes",
-                      "Patch Notes"
-                  )
-
-          except Exception as e:
-              print("Patch Notes error:", e)
-
-          # --------------------------------------------------
-          # Developer Newsletter
-          # --------------------------------------------------
-          try:
-              page = get(
-                  "https://discord.com/developers/developer-newsletter"
-              )
-
-              url = find_link(
-                  page,
-                  r"/developer-newsletter/[^\"'#?]+"
-              )
-
-              if url:
-                  sources["developer_news"] = make_item(
-                      url,
-                      "Discord Developer Newsletter",
-                      "Developer News"
-                  )
-
-          except Exception as e:
-              print("Developer News error:", e)
-
-          # --------------------------------------------------
-          # Official Discord GitHub repository
-          # --------------------------------------------------
-          try:
-              repo = "discord/discord-api-docs"
-
-              commits = json.loads(
-                  get(
-                      f"https://api.github.com/repos/{repo}/commits?per_page=1",
-                      github=True
-                  )
-              )
-
-              latest = commits[0]
-              commit_sha = latest["sha"]
-
-              commit = json.loads(
-                  get(
-                      f"https://api.github.com/repos/{repo}/commits/{commit_sha}",
-                      github=True
-                  )
-              )
-
-              message = commit["commit"]["message"].strip()
-              title = message.splitlines()[0][:250]
-
+          if commits:
+              commit = commits[0]
+              sha = commit.get("sha", "")
+              commit_data = commit.get("commit", {})
+              message = commit_data.get("message", "")
               author = (
-                  commit.get("author", {}).get("login")
-                  or commit["commit"].get("author", {}).get("name")
-                  or "Unknown"
+                  commit_data.get("author", {})
+                  .get("name", "Discord")
               )
 
-              files = [
-                  f["filename"]
-                  for f in commit.get("files", [])
-                  if f.get("filename")
+              commit_url = (
+                  f"https://github.com/discord/discord-api-docs/commit/{sha}"
+              )
+
+              detail_raw = fetch(
+                  f"https://api.github.com/repos/discord/discord-api-docs/commits/{sha}"
+              )
+
+              try:
+                  detail = json.loads(detail_raw)
+              except Exception:
+                  detail = {}
+
+              files = detail.get("files", [])
+              filenames = [
+                  f.get("filename", "")
+                  for f in files
               ]
 
               combined = (
-                  message + "\n" + "\n".join(files)
+                  message
+                  + "\n"
+                  + "\n".join(filenames)
               ).lower()
 
-              # Breaking Changes have highest priority.
-              if any(
-                  x in combined
-                  for x in [
-                      "breaking change",
-                      "breaking-change",
-                      "breaking:",
-                      "deprecated",
-                      "deprecation",
-                      "deprecate",
-                      "removed",
-                      "removal",
-                      "remove endpoint"
-                  ]
-              ):
+              breaking_terms = [
+                  "breaking",
+                  "deprecated",
+                  "deprecation",
+                  "removal",
+                  "removed",
+                  "remove",
+                  "obsolete"
+              ]
+
+              is_breaking = any(
+                  term in combined
+                  for term in breaking_terms
+              )
+
+              is_social_sdk = any(
+                  path.startswith(
+                      (
+                          "resources/discord-social-sdk/",
+                          "developers/discord-social-sdk/"
+                      )
+                  )
+                  for path in filenames
+              )
+
+              is_api = any(
+                  (
+                      path == "developers/reference.mdx"
+                      or path.startswith("developers/reference/")
+                      or path.startswith("developers/resources/")
+                      or path.startswith("developers/events/")
+                      or path.startswith("developers/topics/")
+                      or path.startswith("developers/components/")
+                      or path == "developers/change-log.mdx"
+                  )
+                  for path in filenames
+              )
+
+              if is_breaking:
                   category = "breaking"
-                  category_name = "Breaking Changes"
-
-              elif any(
-                  f.startswith("resources/discord-social-sdk/")
-                  or f.startswith("developers/discord-social-sdk/")
-                  for f in files
-              ):
+                  item_type = "Breaking Change"
+                  source_name = "Discord API Docs"
+              elif is_social_sdk:
                   category = "social_sdk"
-                  category_name = "Social SDK"
-
-              elif any(
-                  f == "developers/reference.mdx"
-                  or f.startswith("developers/reference/")
-                  or f.startswith("developers/resources/")
-                  or f.startswith("developers/events/")
-                  or f.startswith("developers/topics/")
-                  or f.startswith("developers/components/")
-                  or f == "developers/change-log.mdx"
-                  for f in files
-              ):
+                  item_type = "Social SDK"
+                  source_name = "Discord API Docs"
+              elif is_api:
                   category = "api"
-                  category_name = "API Updates"
-
+                  item_type = "API Update"
+                  source_name = "Discord API Docs"
               else:
                   category = "docs"
-                  category_name = "Docs Updates"
+                  item_type = "Documentation Update"
+                  source_name = "Discord API Docs"
 
-              file_list = "\n".join(files[:10])
+              description = message.strip()
 
-              if len(files) > 10:
-                  file_list += f"\n+ {len(files) - 10} more"
+              if not description:
+                  description = "A new official Discord API documentation update was published."
+
+              file_text = "\n".join(filenames[:20])
 
               sources[category] = {
                   "found": True,
-                  "id": commit_sha,
-                  "url": commit["html_url"],
-                  "title": title or "Discord Developer Documentation Update",
-                  "description": (
-                      "An official update was published in "
-                      "the Discord Developer Documentation."
-                  ),
-                  "image": "",
-                  "source": "Discord Developer Documentation",
-                  "type": category_name,
+                  "title": message.splitlines()[0][:250],
+                  "description": description[:1600],
+                  "source": source_name,
+                  "type": item_type,
+                  "url": commit_url,
                   "author": author,
-                  "commit": commit_sha[:12],
-                  "files": file_list
+                  "commit": sha[:12],
+                  "files": file_text
               }
 
-          except Exception as e:
-              print("GitHub error:", e)
+          for category in [
+              "api",
+              "docs",
+              "social_sdk",
+              "breaking"
+          ]:
+              if category not in sources:
+                  sources[category] = {
+                      "found": False
+                  }
 
-          with open("sources.json", "w", encoding="utf-8") as f:
+          with open(
+              "sources.json",
+              "w",
+              encoding="utf-8"
+          ) as f:
               json.dump(
                   sources,
                   f,
@@ -326,6 +317,8 @@ jobs:
               indent=2
           ))
           PY
+
+          python3 discover.py
 
       - name: Create Components V2 sender
         run: |
@@ -351,12 +344,12 @@ jobs:
           title = item.get(
               "title",
               "Official Discord Update"
-          )
+          )[:250]
 
           description = item.get(
               "description",
               "An official update was published by Discord."
-          )
+          )[:1600]
 
           source = item.get(
               "source",
@@ -369,9 +362,8 @@ jobs:
           )
 
           url = item.get("url", "")
-          image = item.get("image", "")
 
-          text = (
+          info = (
               f"**Source**\n"
               f"{source}\n\n"
               f"**Type**\n"
@@ -379,29 +371,31 @@ jobs:
           )
 
           if item.get("author"):
-              text += (
+              info += (
                   f"\n\n**Author**\n"
                   f"{item['author']}"
               )
 
           if item.get("commit"):
-              text += (
+              info += (
                   f"\n\n**Commit**\n"
                   f"`{item['commit']}`"
               )
 
           if item.get("files"):
-              text += (
+              info += (
                   f"\n\n**Changed Files**\n"
-                  f"```text\n{item['files'][:900]}\n```"
+                  f"```text\n"
+                  f"{item['files'][:700]}"
+                  f"\n```"
               )
 
-          inner = [
+          components = [
               {
                   "type": 10,
                   "content": (
                       f"# {title}\n\n"
-                      f"{description[:1800]}"
+                      f"{description}"
                   )
               },
               {
@@ -411,25 +405,8 @@ jobs:
               },
               {
                   "type": 10,
-                  "content": text[:1900]
-              }
-          ]
-
-          if image:
-              inner.append(
-                  {
-                      "type": 12,
-                      "items": [
-                          {
-                              "media": {
-                                  "url": image
-                              }
-                          }
-                      ]
-                  }
-              )
-
-          inner.extend([
+                  "content": info[:1800]
+              },
               {
                   "type": 14,
                   "divider": True,
@@ -446,7 +423,7 @@ jobs:
                       }
                   ]
               }
-          ])
+          ]
 
           usernames = {
               "changelog": "Changelog Updates",
@@ -463,34 +440,32 @@ jobs:
                   category,
                   "Docs Updates"
               ),
-
-              # IS_COMPONENTS_V2
               "flags": 32768,
-
-              "components": [
-                  {
-                      "type": 17,
-                      "accent_color": 5793266,
-                      "components": inner
-                  }
-              ]
+              "components": components
           }
 
           separator = "&" if "?" in webhook else "?"
 
-          url = (
+          endpoint = (
               webhook
               + separator
               + "with_components=true"
               + "&wait=true"
           )
 
+          body = json.dumps(
+              payload,
+              ensure_ascii=False,
+              separators=(",", ":")
+          ).encode("utf-8")
+
+          print("Sending Components V2...")
+          print("Category:", category)
+          print("Title:", title)
+
           request = urllib.request.Request(
-              url,
-              data=json.dumps(
-                  payload,
-                  ensure_ascii=False
-              ).encode("utf-8"),
+              endpoint,
+              data=body,
               method="POST",
               headers={
                   "Content-Type": "application/json",
@@ -503,13 +478,20 @@ jobs:
                   request,
                   timeout=30
               ) as response:
+                  result = response.read().decode(
+                      "utf-8",
+                      "ignore"
+                  )
 
                   print(
                       f"{category}: HTTP {response.status}"
                   )
 
+                  if result:
+                      print(result)
+
           except urllib.error.HTTPError as e:
-              body = e.read().decode(
+              result = e.read().decode(
                   "utf-8",
                   "ignore"
               )
@@ -518,178 +500,62 @@ jobs:
                   f"{category}: HTTP {e.code}"
               )
 
-              print(body)
-
+              print(result)
               sys.exit(1)
           PY
 
-      # ============================================================
-      # CHANGELOG
-      # ============================================================
       - name: Send Changelog
-        if: ${{ hashFiles('sources.json') != '' }}
+        if: ${{ hashFiles('.state-changelog') == '' }}
         env:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_CHANGELOG }}
         run: |
-          python3 - <<'PY'
-          import json
-          import subprocess
-          import os
+          python3 send.py changelog
+          touch .state-changelog
 
-          with open("sources.json", encoding="utf-8") as f:
-              data = json.load(f)
-
-          item = data.get("changelog")
-
-          if item and item.get("found"):
-              state = ".state-changelog"
-
-              old = ""
-              if os.path.exists(state):
-                  old = open(state).read().strip()
-
-              current = item["id"]
-
-              if current != old:
-                  subprocess.run(
-                      ["python3", "send.py", "changelog"],
-                      check=True
-                  )
-
-                  open(state, "w").write(current)
-          PY
-
-      # ============================================================
-      # PATCH NOTES
-      # ============================================================
       - name: Send Patch Notes
+        if: ${{ hashFiles('.state-patch-notes') == '' }}
         env:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_PATCH_NOTES }}
         run: |
-          python3 - <<'PY'
-          import json
-          import subprocess
-          import os
+          python3 send.py patch_notes
+          touch .state-patch-notes
 
-          with open("sources.json", encoding="utf-8") as f:
-              data = json.load(f)
-
-          item = data.get("patch_notes")
-
-          if item and item.get("found"):
-              state = ".state-patch"
-
-              old = ""
-              if os.path.exists(state):
-                  old = open(state).read().strip()
-
-              current = item["id"]
-
-              if current != old:
-                  subprocess.run(
-                      ["python3", "send.py", "patch_notes"],
-                      check=True
-                  )
-
-                  open(state, "w").write(current)
-          PY
-
-      # ============================================================
-      # DEVELOPER NEWS
-      # ============================================================
       - name: Send Developer News
+        if: ${{ hashFiles('.state-developer-news') == '' }}
         env:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_DEVELOPER_NEWS }}
         run: |
-          python3 - <<'PY'
-          import json
-          import subprocess
-          import os
+          python3 send.py developer_news
+          touch .state-developer-news
 
-          with open("sources.json", encoding="utf-8") as f:
-              data = json.load(f)
-
-          item = data.get("developer_news")
-
-          if item and item.get("found"):
-              state = ".state-developer-news"
-
-              old = ""
-              if os.path.exists(state):
-                  old = open(state).read().strip()
-
-              current = item["id"]
-
-              if current != old:
-                  subprocess.run(
-                      ["python3", "send.py", "developer_news"],
-                      check=True
-                  )
-
-                  open(state, "w").write(current)
-          PY
-
-      # ============================================================
-      # API
-      # ============================================================
-      - name: Send API Update
+      - name: Send API Updates
+        if: ${{ hashFiles('.state-api') == '' }}
         env:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_API }}
         run: |
-          python3 - <<'PY'
-          import json
-          import subprocess
-          import os
+          python3 send.py api
+          touch .state-api
 
-          with open("sources.json", encoding="utf-8") as f:
-              data = json.load(f)
-
-          item = data.get("api")
-
-          if item and item.get("found"):
-              state = ".state-api"
-
-              old = ""
-              if os.path.exists(state):
-                  old = open(state).read().strip()
-
-              current = item["id"]
-
-              if current != old:
-                  subprocess.run(
-                      ["python3", "send.py", "api"],
-                      check=True
-                  )
-
-                  open(state, "w").write(current)
-          PY
-
-      # ============================================================
-      # DOCS
-      # ============================================================
-      - name: Send Docs Update
+      - name: Send Docs Updates
+        if: ${{ hashFiles('.state-docs') == '' }}
         env:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_DOCS }}
         run: |
-          python3 - <<'PY'
-          import json
-          import subprocess
-          import os
+          python3 send.py docs
+          touch .state-docs
 
-          with open("sources.json", encoding="utf-8") as f:
-              data = json.load(f)
+      - name: Send Social SDK
+        if: ${{ hashFiles('.state-social-sdk') == '' }}
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_SOCIAL_SDK }}
+        run: |
+          python3 send.py social_sdk
+          touch .state-social-sdk
 
-          item = data.get("docs")
-
-          if item and item.get("found"):
-              state = ".state-docs"
-
-              old = ""
-              if os.path.exists(state):
-                  old = open(state).read().strip()
-
-              current = item["id"]
-
-              if current != old:
-                  subprocess.run(
-                      ["python3", "send.py
+      - name: Send Breaking Changes
+        if: ${{ hashFiles('.state-breaking') == '' }}
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_BREAKING }}
+        run: |
+          python3 send.py breaking
+          touch .state-breaking
