@@ -14,15 +14,15 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-      - name: Restore update state
+      - name: Restore state
         uses: actions/cache@v6
         with:
           path: .discord-state
-          key: discord-news-state-${{ github.run_id }}
+          key: discord-news-${{ github.run_id }}
           restore-keys: |
-            discord-news-state-
+            discord-news-
 
-      - name: Fetch sources and send updates
+      - name: Fetch official Discord updates and send
         env:
           WEBHOOK_API: ${{ secrets.WEBHOOK_API }}
           WEBHOOK_BREAKING: ${{ secrets.WEBHOOK_BREAKING }}
@@ -34,14 +34,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          python3 <<'PY'
+          python3 - <<'PY'
           import os
           import re
           import json
           import hashlib
           import urllib.request
-          import urllib.parse
           import urllib.error
+          import urllib.parse
           from pathlib import Path
           from html import unescape
           from html.parser import HTMLParser
@@ -50,36 +50,25 @@ jobs:
           STATE_DIR.mkdir(parents=True, exist_ok=True)
 
           HEADERS = {
-              "User-Agent": "Mozilla/5.0 (DiscordDocsNews/2.0)",
+              "User-Agent": "Mozilla/5.0 (DiscordDocsNews/3.0)",
               "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
           }
 
-          CHANGELOG_RAW = (
-              "https://raw.githubusercontent.com/"
-              "discord/discord-api-docs/main/docs/change-log.mdx"
-          )
-
-          CHANGELOG_PAGE = "https://discord.com/developers/docs/change-log"
-
-          SOURCES = {
-              "patch_notes": {
-                  "webhook": "WEBHOOK_PATCH_NOTES",
-                  "tag_url": "https://discord.com/tags/patch-notes",
-                  "match": lambda title: "patch notes" in title.lower(),
-              },
-
-              "changelog": {
-                  "webhook": "WEBHOOK_CHANGELOG",
-                  "tag_url": "https://discord.com/tags/changelog",
-                  "match": lambda title: "changelog" in title.lower(),
-              },
-
-              "developer_news": {
-                  "webhook": "WEBHOOK_DEVELOPER_NEWS",
-                  "tag_url": "https://discord.com/developers/developer-newsletter",
-                  "match": lambda title: True,
-              },
+          BLOG_TAGS = {
+              "patch_notes": (
+                  "WEBHOOK_PATCH_NOTES",
+                  "https://discord.com/tags/patch-notes",
+                  "patch notes",
+              ),
+              "changelog": (
+                  "WEBHOOK_CHANGELOG",
+                  "https://discord.com/tags/changelog",
+                  "changelog",
+              ),
           }
+
+          NEWSLETTER_URL = "https://discord.com/developers/developer-newsletter"
+          DEVELOPER_CHANGELOG_URL = "https://docs.discord.com/developers/change-log"
 
 
           def fetch(url):
@@ -95,13 +84,7 @@ jobs:
                   )
 
 
-          def absolute_url(base, value):
-              if not value:
-                  return ""
-              return urllib.parse.urljoin(base, value)
-
-
-          def clean_text(value):
+          def clean(value):
               value = unescape(value or "")
               value = re.sub(r"\s+", " ", value)
               return value.strip()
@@ -111,61 +94,54 @@ jobs:
               def __init__(self):
                   super().__init__()
                   self.links = []
-                  self.current_href = None
-                  self.current_text = []
+                  self.href = None
+                  self.text = []
 
               def handle_starttag(self, tag, attrs):
                   if tag.lower() == "a":
-                      attributes = dict(attrs)
-                      self.current_href = attributes.get("href")
-                      self.current_text = []
+                      data = dict(attrs)
+                      self.href = data.get("href")
+                      self.text = []
 
               def handle_data(self, data):
-                  if self.current_href is not None:
-                      self.current_text.append(data)
+                  if self.href is not None:
+                      self.text.append(data)
 
               def handle_endtag(self, tag):
-                  if tag.lower() == "a" and self.current_href is not None:
-                      text = clean_text(" ".join(self.current_text))
+                  if tag.lower() == "a" and self.href is not None:
+                      title = clean(" ".join(self.text))
 
-                      if self.current_href and text:
-                          self.links.append(
-                              (self.current_href, text)
-                          )
+                      if self.href and title:
+                          self.links.append((self.href, title))
 
-                      self.current_href = None
-                      self.current_text = []
+                      self.href = None
+                      self.text = []
 
 
-          def extract_links(html, base):
+          def get_links(html, base_url):
               parser = LinkParser()
               parser.feed(html)
 
               result = []
 
               for href, title in parser.links:
-                  result.append(
-                      (
-                          absolute_url(base, href),
-                          title
-                      )
-                  )
+                  url = urllib.parse.urljoin(base_url, href)
+                  result.append((url, title))
 
               return result
 
 
           class ArticleParser(HTMLParser):
-              BLOCK_TAGS = {
+              BLOCKS = {
+                  "p",
                   "h1",
                   "h2",
                   "h3",
                   "h4",
                   "h5",
                   "h6",
-                  "p",
                   "li",
                   "blockquote",
-                  "pre",
               }
 
               def __init__(self):
@@ -173,125 +149,80 @@ jobs:
 
                   self.article_depth = 0
                   self.main_depth = 0
-
-                  self.article_blocks = []
-                  self.main_blocks = []
-
-                  self.article_images = []
-                  self.main_images = []
+                  self.skip_depth = 0
 
                   self.current_tag = None
-                  self.current_buffer = []
-                  self.current_depth = 0
+                  self.current_text = []
+                  self.blocks = []
 
-                  self.list_depth = 0
+                  self.images = []
 
-              def in_article(self):
-                  return self.article_depth > 0
-
-              def in_main(self):
-                  return self.main_depth > 0
-
-              def target(self):
-                  if self.in_article():
-                      return "article"
-
-                  if self.in_main():
-                      return "main"
-
-                  return None
+              def inside_content(self):
+                  return self.article_depth > 0 or self.main_depth > 0
 
               def handle_starttag(self, tag, attrs):
                   tag = tag.lower()
-                  attributes = dict(attrs)
+                  data = dict(attrs)
+
+                  if tag in ("script", "style", "noscript"):
+                      self.skip_depth += 1
+                      return
+
+                  if self.skip_depth:
+                      return
 
                   if tag == "article":
                       self.article_depth += 1
 
-                  if tag == "main":
+                  elif tag == "main":
                       self.main_depth += 1
 
-                  if tag == "li":
-                      self.list_depth += 1
-
-                  if tag == "img":
+                  elif tag == "img" and self.inside_content():
                       src = (
-                          attributes.get("src")
-                          or attributes.get("data-src")
-                          or attributes.get("data-lazy-src")
+                          data.get("src")
+                          or data.get("data-src")
+                          or data.get("data-lazy-src")
                       )
 
-                      alt = clean_text(attributes.get("alt", ""))
+                      if src:
+                          self.images.append(src)
 
-                      if src and self.target():
-                          item = {
-                              "url": src,
-                              "alt": alt
-                          }
-
-                          target = (
-                              self.article_images
-                              if self.in_article()
-                              else self.main_images
-                          )
-
-                          target.append(item)
-
-                  if tag in self.BLOCK_TAGS:
+                  if tag in self.BLOCKS and self.inside_content():
                       if self.current_tag is None:
                           self.current_tag = tag
-                          self.current_buffer = []
-                          self.current_depth = 1
-                      else:
-                          self.current_depth += 1
-
-              def handle_startendtag(self, tag, attrs):
-                  self.handle_starttag(tag, attrs)
-                  self.handle_endtag(tag)
+                          self.current_text = []
 
               def handle_data(self, data):
+                  if self.skip_depth:
+                      return
+
                   if self.current_tag is not None:
-                      self.current_buffer.append(data)
+                      self.current_text.append(data)
 
               def handle_endtag(self, tag):
                   tag = tag.lower()
 
-                  if tag in self.BLOCK_TAGS and self.current_tag is not None:
-                      if self.current_depth > 1:
-                          self.current_depth -= 1
-                      else:
-                          text = clean_text(
-                              " ".join(self.current_buffer)
-                          )
+                  if tag in ("script", "style", "noscript"):
+                      self.skip_depth = max(0, self.skip_depth - 1)
+                      return
 
-                          if text:
-                              if self.in_article():
-                                  self.article_blocks.append(
-                                      (self.current_tag, text)
-                                  )
-                              elif self.in_main():
-                                  self.main_blocks.append(
-                                      (self.current_tag, text)
-                                  )
+                  if self.skip_depth:
+                      return
 
-                          self.current_tag = None
-                          self.current_buffer = []
-                          self.current_depth = 0
+                  if tag in self.BLOCKS and self.current_tag == tag:
+                      text = clean(" ".join(self.current_text))
 
-                  if tag == "li":
-                      self.list_depth = max(0, self.list_depth - 1)
+                      if text:
+                          self.blocks.append((tag, text))
+
+                      self.current_tag = None
+                      self.current_text = []
 
                   if tag == "article":
-                      self.article_depth = max(
-                          0,
-                          self.article_depth - 1
-                      )
+                      self.article_depth = max(0, self.article_depth - 1)
 
-                  if tag == "main":
-                      self.main_depth = max(
-                          0,
-                          self.main_depth - 1
-                      )
+                  elif tag == "main":
+                      self.main_depth = max(0, self.main_depth - 1)
 
 
           def extract_article(url):
@@ -300,17 +231,7 @@ jobs:
               parser = ArticleParser()
               parser.feed(html)
 
-              blocks = (
-                  parser.article_blocks
-                  if parser.article_blocks
-                  else parser.main_blocks
-              )
-
-              images = (
-                  parser.article_images
-                  if parser.article_blocks
-                  else parser.main_images
-              )
+              blocks = parser.blocks
 
               title = ""
 
@@ -326,24 +247,18 @@ jobs:
                   r"\b(?:January|February|March|April|May|June|"
                   r"July|August|September|October|November|December)"
                   r"\s+\d{1,2},\s+20\d{2}\b",
-                  html
+                  html,
+                  re.I,
               )
 
-              date = (
-                  date_match.group(0)
-                  if date_match
-                  else ""
-              )
+              date = date_match.group(0) if date_match else ""
 
-              output = []
-
+              paragraphs = []
               seen = set()
 
               for tag, text in blocks:
-                  if text in seen:
+                  if not text:
                       continue
-
-                  seen.add(text)
 
                   if text == title:
                       continue
@@ -351,48 +266,40 @@ jobs:
                   if date and text == date:
                       continue
 
-                  if tag.startswith("h"):
-                      output.append(f"## {text}")
+                  if text in seen:
+                      continue
 
-                  elif tag == "li":
-                      output.append(f"- {text}")
+                  seen.add(text)
 
+                  if tag == "li":
+                      paragraphs.append(f"- {text}")
                   elif tag == "blockquote":
-                      output.append(f"> {text}")
-
+                      paragraphs.append(f"> {text}")
+                  elif tag.startswith("h"):
+                      paragraphs.append(f"## {text}")
                   else:
-                      output.append(text)
+                      paragraphs.append(text)
 
-              content = "\n\n".join(output)
+              content = "\n\n".join(paragraphs).strip()
 
-              content = re.sub(
-                  r"\n{3,}",
-                  "\n\n",
-                  content
-              ).strip()
+              images = []
 
-              image_urls = []
+              for image in parser.images:
+                  image = urllib.parse.urljoin(url, image)
 
-              for image in images:
-                  image_url = absolute_url(url, image["url"])
-
-                  if not image_url:
+                  if not image.startswith("http"):
                       continue
 
-                  if image_url.startswith("data:"):
+                  if image.startswith("data:"):
                       continue
 
-                  if image_url in image_urls:
+                  if image.lower().endswith(".svg"):
                       continue
 
-                  low = image_url.lower()
+                  if image not in images:
+                      images.append(image)
 
-                  if low.endswith(".svg"):
-                      continue
-
-                  image_urls.append(image_url)
-
-                  if len(image_urls) >= 4:
+                  if len(images) >= 4:
                       break
 
               return {
@@ -400,193 +307,233 @@ jobs:
                   "date": date,
                   "url": url,
                   "content": content,
-                  "images": image_urls,
+                  "images": images,
               }
 
 
-          def find_latest_tag_article(tag_url, matcher):
+          def find_blog_update(tag_url, keyword):
               html = fetch(tag_url)
+              links = get_links(html, tag_url)
 
-              links = extract_links(
-                  html,
-                  tag_url
-              )
+              candidates = []
 
               for url, title in links:
-                  if not url.startswith("https://discord.com/"):
-                      continue
-
                   if "/blog/" not in url:
                       continue
 
-                  if matcher(title):
-                      return extract_article(url)
+                  if keyword.lower() in title.lower():
+                      candidates.append((url, title))
 
-              return None
+              if not candidates:
+                  raise RuntimeError(
+                      f"No official Discord article found at {tag_url}"
+                  )
+
+              return extract_article(candidates[0][0])
 
 
           def find_latest_newsletter():
-              html = fetch(
-                  "https://discord.com/developers/developer-newsletter"
-              )
-
-              links = extract_links(
-                  html,
-                  "https://discord.com/developers/developer-newsletter"
-              )
+              html = fetch(NEWSLETTER_URL)
+              links = get_links(html, NEWSLETTER_URL)
 
               for url, title in links:
                   if "/developer-newsletter/" in url:
                       return extract_article(url)
 
-              return None
-
-
-          def parse_changelog():
-              mdx = fetch(CHANGELOG_RAW)
-
-              pattern = re.compile(
-                  r'<Update\b'
-                  r'(?=[^>]*\blabel="([^"]+)")'
-                  r'(?=[^>]*\btags=\{\[([^\]]*)\]\})'
-                  r'[^>]*>'
-                  r'(.*?)'
-                  r'</Update>',
-                  re.I | re.S
+              raise RuntimeError(
+                  "No official Discord Developer Newsletter article found"
               )
+
+
+          class TextParser(HTMLParser):
+              BLOCKS = {
+                  "h1",
+                  "h2",
+                  "h3",
+                  "h4",
+                  "h5",
+                  "h6",
+                  "p",
+                  "li",
+                  "button",
+              }
+
+              def __init__(self):
+                  super().__init__()
+                  self.skip = 0
+                  self.current = None
+                  self.buffer = []
+                  self.lines = []
+
+              def handle_starttag(self, tag, attrs):
+                  tag = tag.lower()
+
+                  if tag in ("script", "style", "noscript"):
+                      self.skip += 1
+                      return
+
+                  if self.skip:
+                      return
+
+                  if tag in self.BLOCKS:
+                      self.current = tag
+                      self.buffer = []
+
+              def handle_data(self, data):
+                  if self.skip:
+                      return
+
+                  if self.current is not None:
+                      self.buffer.append(data)
+
+              def handle_endtag(self, tag):
+                  tag = tag.lower()
+
+                  if tag in ("script", "style", "noscript"):
+                      self.skip = max(0, self.skip - 1)
+                      return
+
+                  if self.skip:
+                      return
+
+                  if self.current == tag:
+                      text = clean(" ".join(self.buffer))
+
+                      if text:
+                          self.lines.append(text)
+
+                      self.current = None
+                      self.buffer = []
+
+
+          def parse_developer_changelog():
+              html = fetch(DEVELOPER_CHANGELOG_URL)
+
+              parser = TextParser()
+              parser.feed(html)
+
+              lines = []
+
+              for line in parser.lines:
+                  if line not in lines:
+                      lines.append(line)
+
+              date_pattern = re.compile(
+                  r"^(January|February|March|April|May|June|July|"
+                  r"August|September|October|November|December)"
+                  r"\s+\d{1,2},\s+20\d{2}$",
+                  re.I,
+              )
+
+              positions = []
+
+              for index, line in enumerate(lines):
+                  if date_pattern.match(line):
+                      positions.append(index)
 
               entries = []
 
-              for match in pattern.finditer(mdx):
-                  date = match.group(1).strip()
-
-                  tags_raw = match.group(2)
-
-                  tags = re.findall(
-                      r'"([^"]+)"',
-                      tags_raw
+              for pos_index, start in enumerate(positions):
+                  end = (
+                      positions[pos_index + 1]
+                      if pos_index + 1 < len(positions)
+                      else len(lines)
                   )
 
-                  body = match.group(3).strip()
+                  chunk = lines[start:end]
 
-                  if not body:
+                  if len(chunk) < 3:
+                      continue
+
+                  date = chunk[0]
+
+                  category = ""
+                  title = ""
+                  body_start = 1
+
+                  for i in range(1, min(len(chunk), 8)):
+                      value = chunk[i]
+
+                      if value in {
+                          "HTTP API",
+                          "HTTP API Breaking Change",
+                          "Discord Social SDK",
+                          "Discord Social SDK HTTP API",
+                          "Gateway",
+                          "Gateway Activities",
+                          "Interactions",
+                          "Components",
+                          "Documentation",
+                          "Breaking Change",
+                      }:
+                          category = value
+                          body_start = i + 1
+                          break
+
+                  if body_start < len(chunk):
+                      title = chunk[body_start]
+                      body_start += 1
+
+                  body = "\n\n".join(
+                      chunk[body_start:]
+                  ).strip()
+
+                  if not title:
                       continue
 
                   entries.append({
                       "date": date,
-                      "tags": tags,
-                      "body": body,
+                      "category": category,
+                      "title": title,
+                      "content": body,
                   })
 
               return entries
 
 
-          def clean_mdx(text):
-              text = re.sub(
-                  r"<!--.*?-->",
-                  "",
-                  text,
-                  flags=re.S
-              )
-
-              text = re.sub(
-                  r"^\s*import .*?$",
-                  "",
-                  text,
-                  flags=re.M
-              )
-
-              text = re.sub(
-                  r"<[^>]+>",
-                  "",
-                  text
-              )
-
-              def fix_link(match):
-                  label = match.group(1)
-                  url = match.group(2)
-
-                  if url.startswith("/"):
-                      url = "https://discord.com" + url
-
-                  return f"[{label}]({url})"
-
-              text = re.sub(
-                  r"\[([^\]]+)\]\(([^)]+)\)",
-                  fix_link,
-                  text
-              )
-
-              text = re.sub(
-                  r"!\[([^\]]*)\]\(([^)]+)\)",
-                  "",
-                  text
-              )
-
-              text = re.sub(
-                  r"\n{3,}",
-                  "\n\n",
-                  text
-              )
-
-              return text.strip()
-
-
-          def changelog_entry(entry):
-              body = clean_mdx(entry["body"])
-
-              title = ""
-
-              for line in body.splitlines():
-                  line = line.strip()
-
-                  if line.startswith("## "):
-                      title = line[3:].strip()
-                      break
-
-              if not title:
-                  title = "Discord Developer Changelog"
-
-              return {
-                  "title": title,
-                  "date": entry["date"],
-                  "url": CHANGELOG_PAGE,
-                  "content": body,
-                  "images": [],
-              }
-
-
-          def find_changelog_category(entries, category):
+          def find_developer_update(entries, kind):
               for entry in entries:
-                  tags = {
-                      tag.lower()
-                      for tag in entry["tags"]
-                  }
+                  category = entry["category"].lower()
+                  title = entry["title"].lower()
+                  content = entry["content"].lower()
 
-                  if category == "api":
+                  if kind == "breaking":
                       if (
-                          "http api" in tags
-                          or "interactions" in tags
+                          "breaking change" in category
+                          or "breaking change" in title
                       ):
-                          return changelog_entry(entry)
+                          return entry
 
-                  elif category == "social_sdk":
-                      if "discord social sdk" in tags:
-                          return changelog_entry(entry)
-
-                  elif category == "breaking":
-                      if "breaking change" in tags:
-                          return changelog_entry(entry)
-
-                  elif category == "docs":
+                  elif kind == "api":
                       if (
-                          "documentation" in tags
-                          or "docs" in tags
-                          or "documentation changes" in tags
+                          "http api" in category
+                          and "breaking change" not in category
                       ):
-                          return changelog_entry(entry)
+                          return entry
+
+                  elif kind == "social_sdk":
+                      if "social sdk" in category:
+                          return entry
+
+                  elif kind == "docs":
+                      if (
+                          "documentation" in category
+                          or "documentation" in title
+                          or "developer resources" in content
+                      ):
+                          return entry
 
               return None
+
+
+          def make_item(entry):
+              return {
+                  "title": entry["title"],
+                  "date": entry["date"],
+                  "url": DEVELOPER_CHANGELOG_URL,
+                  "content": entry["content"],
+                  "images": [],
+              }
 
 
           def make_id(item):
@@ -605,12 +552,12 @@ jobs:
               ).hexdigest()
 
 
-          def state_file(category):
+          def state_path(category):
               return STATE_DIR / f"{category}.state"
 
 
-          def read_state(category):
-              path = state_file(category)
+          def get_state(category):
+              path = state_path(category)
 
               if not path.exists():
                   return ""
@@ -620,14 +567,17 @@ jobs:
               ).strip()
 
 
-          def write_state(category, value):
-              state_file(category).write_text(
+          def set_state(category, value):
+              state_path(category).write_text(
                   value,
                   encoding="utf-8"
               )
 
 
-          def split_content(text, limit=3500):
+          def split_text(text, limit=3500):
+              if not text:
+                  return [""]
+
               paragraphs = text.split("\n\n")
 
               chunks = []
@@ -652,25 +602,10 @@ jobs:
                   if current:
                       chunks.append(current)
 
-                  if len(paragraph) <= limit:
-                      current = paragraph
-                      continue
-
                   while len(paragraph) > limit:
-                      cut = paragraph.rfind(
-                          "\n",
-                          0,
-                          limit
-                      )
+                      cut = paragraph.rfind(" ", 0, limit)
 
-                      if cut < 1000:
-                          cut = paragraph.rfind(
-                              " ",
-                              0,
-                              limit
-                          )
-
-                      if cut < 1000:
+                      if cut < 500:
                           cut = limit
 
                       chunks.append(
@@ -687,19 +622,65 @@ jobs:
               return chunks or [""]
 
 
-          def media_component(images):
-              if not images:
-                  return None
+          def build_payload(item, text, index, total):
+              components = []
 
-              items = []
+              if index == 0:
+                  for image in item.get("images", []):
+                      components.append({
+                          "type": 12,
+                          "items": [
+                              {
+                                  "type": 1,
+                                  "media": {
+                                      "url": image
+                                  }
+                              }
+                          ]
+                      })
 
-              for url in images:
-                  items.append({
-                      "type": 1,
-                      "media": {
-                          "url": url
-                      }
+              title = item["title"]
+
+              if total > 1:
+                  title = (
+                      f"{title}\n"
+                      f"Part {index + 1}/{total}"
+                  )
+
+              components.append({
+                  "type": 10,
+                  "content": f"# {title}",
+              })
+
+              if item.get("date"):
+                  components.append({
+                      "type": 10,
+                      "content": f"**Published:** {item['date']}",
                   })
 
-              return {
-                  "type": 
+              components.append({
+                  "type": 14,
+                  "spacing": 1,
+              })
+
+              if text:
+                  components.append({
+                      "type": 10,
+                      "content": text,
+                  })
+
+              if index == total - 1:
+                  components.append({
+                      "type": 14,
+                      "spacing": 1,
+                  })
+
+                  components.append({
+                      "type": 1,
+                      "components": [
+                          {
+                              "type": 2,
+                              "style": 5,
+                              "label": "View Source",
+                              "url": item["url"],
+   
