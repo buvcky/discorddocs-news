@@ -17,10 +17,10 @@ jobs:
       - name: Restore state
         uses: actions/cache@v6
         with:
-          path: .discord-state-v3
-          key: discord-news-v3-${{ github.run_id }}
+          path: .discord-state-v4
+          key: discord-news-v4-${{ github.run_id }}
           restore-keys: |
-            discord-news-v3-
+            discord-news-v4-
 
       - name: Install parser
         run: |
@@ -35,6 +35,7 @@ jobs:
           WEBHOOK_DOCS: ${{ secrets.WEBHOOK_DOCS }}
           WEBHOOK_SOCIAL_SDK: ${{ secrets.WEBHOOK_SOCIAL_SDK }}
           WEBHOOK_BREAKING: ${{ secrets.WEBHOOK_BREAKING }}
+          MANUAL_RUN: ${{ github.event_name == 'workflow_dispatch' && 'true' || 'false' }}
         run: |
           set -euo pipefail
 
@@ -47,110 +48,52 @@ jobs:
           import urllib.error
           import urllib.parse
           from pathlib import Path
-          from datetime import datetime
           from bs4 import BeautifulSoup, NavigableString, Tag
 
-          STATE = Path(".discord-state-v3")
+          STATE = Path(".discord-state-v4")
           STATE.mkdir(parents=True, exist_ok=True)
 
           HEADERS = {
-              "User-Agent": "Mozilla/5.0 DiscordDocsNews/8.0",
+              "User-Agent": "Mozilla/5.0 DiscordDocsNews/9.0",
               "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
           }
 
           MAX_TEXT = 3900
-          MAX_CONTAINER_BYTES = 8500
-          MAX_CONTAINER_CHILDREN = 9
-
-          DATE_RE = re.compile(
-              r"^(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}$",
-              re.I
-          )
+          MAX_PAYLOAD = 8000
+          MAX_COMPONENTS = 8
 
           def fetch(url):
-              req = urllib.request.Request(url, headers=HEADERS)
+              request = urllib.request.Request(url, headers=HEADERS)
+
               try:
-                  with urllib.request.urlopen(req, timeout=60) as response:
+                  with urllib.request.urlopen(request, timeout=60) as response:
                       return response.read().decode("utf-8", "replace")
-              except urllib.error.HTTPError as e:
-                  body = e.read().decode("utf-8", "replace")
+
+              except urllib.error.HTTPError as error:
+                  body = error.read().decode("utf-8", "replace")
                   raise RuntimeError(
                       "HTTP {} while fetching {}: {}".format(
-                          e.code, url, body[:1000]
+                          error.code,
+                          url,
+                          body[:1000]
                       )
                   )
 
           def absolute_url(base, value):
               if not value:
                   return ""
-              return urllib.parse.urljoin(base, value.strip())
 
-          def clean_text(value):
-              value = re.sub(r"\s+", " ", value or "")
-              return value.strip()
-
-          def inline_markdown(node, base_url):
-              if isinstance(node, NavigableString):
-                  return str(node).replace("\xa0", " ")
-
-              if not isinstance(node, Tag):
-                  return ""
-
-              name = node.name.lower()
-
-              if name in ("script", "style", "noscript", "svg"):
-                  return ""
-
-              if name == "br":
-                  return "\n"
-
-              if name == "a":
-                  text = "".join(
-                      inline_markdown(child, base_url)
-                      for child in node.children
-                  ).strip()
-                  href = absolute_url(base_url, node.get("href", ""))
-                  if href and text:
-                      return "[{}]({})".format(text, href)
-                  return text
-
-              if name in ("strong", "b"):
-                  text = "".join(
-                      inline_markdown(child, base_url)
-                      for child in node.children
-                  ).strip()
-                  return "**{}**".format(text) if text else ""
-
-              if name in ("em", "i"):
-                  text = "".join(
-                      inline_markdown(child, base_url)
-                      for child in node.children
-                  ).strip()
-                  return "*{}*".format(text) if text else ""
-
-              if name == "del":
-                  text = "".join(
-                      inline_markdown(child, base_url)
-                      for child in node.children
-                  ).strip()
-                  return "~~{}~~".format(text) if text else ""
-
-              if name == "code":
-                  text = node.get_text(" ", strip=True)
-                  return "`{}`".format(text) if text else ""
-
-              if name == "img":
-                  return ""
-
-              result = "".join(
-                  inline_markdown(child, base_url)
-                  for child in node.children
+              return urllib.parse.urljoin(
+                  base,
+                  value.strip()
               )
 
-              result = re.sub(r"[ \t]+", " ", result)
-              result = re.sub(r" *\n *", "\n", result)
-
-              return result
+          def clean_text(value):
+              value = value or ""
+              value = value.replace("\xa0", " ")
+              value = re.sub(r"[ \t]+", " ", value)
+              value = re.sub(r"\n{3,}", "\n\n", value)
+              return value.strip()
 
           def split_text(text, limit=MAX_TEXT):
               text = text.strip()
@@ -161,37 +104,41 @@ jobs:
               if len(text) <= limit:
                   return [text]
 
-              pieces = []
+              result = []
               remaining = text
 
               while len(remaining) > limit:
                   cut = remaining.rfind("\n\n", 0, limit)
 
-                  if cut < 1000:
+                  if cut < 500:
                       cut = remaining.rfind("\n", 0, limit)
 
-                  if cut < 1000:
+                  if cut < 500:
                       cut = remaining.rfind(" ", 0, limit)
 
                   if cut < 500:
                       cut = limit
 
-                  pieces.append(remaining[:cut].strip())
+                  part = remaining[:cut].strip()
+
+                  if part:
+                      result.append(part)
+
                   remaining = remaining[cut:].strip()
 
               if remaining:
-                  pieces.append(remaining)
+                  result.append(remaining)
 
-              return pieces
+              return result
 
           def text_component(text):
               components = []
 
-              for piece in split_text(text):
-                  if piece.strip():
+              for part in split_text(text):
+                  if part:
                       components.append({
                           "type": 10,
-                          "content": piece.strip()
+                          "content": part
                       })
 
               return components
@@ -202,53 +149,252 @@ jobs:
                   "spacing": 1
               }
 
-          def media_component(urls):
-              urls = [u for u in urls if u]
+          def image_urls_from(tag, base_url):
+              urls = []
 
-              if not urls:
-                  return None
+              for img in tag.find_all("img"):
+                  candidates = [
+                      img.get("src"),
+                      img.get("data-src"),
+                      img.get("data-lazy-src"),
+                      img.get("data-original")
+                  ]
 
-              items = []
+                  srcset = img.get("srcset")
 
-              for url in urls[:10]:
-                  items.append({
-                      "type": 1,
-                      "media": {
-                          "url": url
-                      }
+                  if srcset:
+                      for item in srcset.split(","):
+                          value = item.strip().split(" ")[0]
+
+                          if value:
+                              candidates.append(value)
+
+                  for candidate in candidates:
+                      if not candidate:
+                          continue
+
+                      url = absolute_url(
+                          base_url,
+                          candidate
+                      )
+
+                      if (
+                          url.startswith("http://")
+                          or url.startswith("https://")
+                      ):
+                          if url not in urls:
+                              urls.append(url)
+
+              return urls
+
+          def media_components(urls):
+              urls = [
+                  url for url in urls
+                  if url
+              ]
+
+              result = []
+
+              for start in range(0, len(urls), 10):
+                  group = urls[start:start + 10]
+
+                  if not group:
+                      continue
+
+                  result.append({
+                      "type": 12,
+                      "items": [
+                          {
+                              "type": 1,
+                              "media": {
+                                  "url": image
+                              }
+                          }
+                          for image in group
+                      ]
                   })
 
-              return {
-                  "type": 12,
-                  "items": items
-              }
+              return result
+
+          def inline_markdown(node, base_url):
+              if isinstance(node, NavigableString):
+                  return str(node).replace("\xa0", " ")
+
+              if not isinstance(node, Tag):
+                  return ""
+
+              name = node.name.lower()
+
+              if name in (
+                  "script",
+                  "style",
+                  "noscript",
+                  "svg",
+                  "img"
+              ):
+                  return ""
+
+              if name == "br":
+                  return "\n"
+
+              if name == "a":
+                  text = "".join(
+                      inline_markdown(
+                          child,
+                          base_url
+                      )
+                      for child in node.children
+                  )
+
+                  text = clean_text(text)
+
+                  href = absolute_url(
+                      base_url,
+                      node.get("href", "")
+                  )
+
+                  if href and text:
+                      return "[{}]({})".format(
+                          text,
+                          href
+                      )
+
+                  return text
+
+              if name in ("strong", "b"):
+                  text = clean_text(
+                      "".join(
+                          inline_markdown(
+                              child,
+                              base_url
+                          )
+                          for child in node.children
+                      )
+                  )
+
+                  return (
+                      "**{}**".format(text)
+                      if text
+                      else ""
+                  )
+
+              if name in ("em", "i"):
+                  text = clean_text(
+                      "".join(
+                          inline_markdown(
+                              child,
+                              base_url
+                          )
+                          for child in node.children
+                      )
+                  )
+
+                  return (
+                      "*{}*".format(text)
+                      if text
+                      else ""
+                  )
+
+              if name == "del":
+                  text = clean_text(
+                      "".join(
+                          inline_markdown(
+                              child,
+                              base_url
+                          )
+                          for child in node.children
+                      )
+                  )
+
+                  return (
+                      "~~{}~~".format(text)
+                      if text
+                      else ""
+                  )
+
+              if name == "code":
+                  text = node.get_text(
+                      " ",
+                      strip=True
+                  )
+
+                  return (
+                      "`{}`".format(text)
+                      if text
+                      else ""
+                  )
+
+              result = "".join(
+                  inline_markdown(
+                      child,
+                      base_url
+                  )
+                  for child in node.children
+              )
+
+              result = re.sub(
+                  r"[ \t]+",
+                  " ",
+                  result
+              )
+
+              result = re.sub(
+                  r" *\n *",
+                  "\n",
+                  result
+              )
+
+              return result
 
           def render_list(tag, base_url):
               ordered = tag.name.lower() == "ol"
               lines = []
               number = 1
 
-              for li in tag.find_all("li", recursive=False):
-                  text = inline_markdown(li, base_url)
-                  text = re.sub(r"\s+", " ", text).strip()
+              for li in tag.find_all(
+                  "li",
+                  recursive=False
+              ):
+                  text = inline_markdown(
+                      li,
+                      base_url
+                  )
+
+                  text = clean_text(text)
 
                   if not text:
                       continue
 
-                  prefix = "{}. ".format(number) if ordered else "- "
-                  lines.append(prefix + text)
+                  if ordered:
+                      prefix = "{}. ".format(number)
+                  else:
+                      prefix = "- "
+
+                  lines.append(
+                      prefix + text
+                  )
+
                   number += 1
 
               return "\n".join(lines)
 
           def render_blocks(parent, base_url):
-              output = []
+              result = []
 
               for child in parent.children:
-                  if isinstance(child, NavigableString):
-                      text = clean_text(str(child))
+                  if isinstance(
+                      child,
+                      NavigableString
+                  ):
+                      text = clean_text(
+                          str(child)
+                      )
+
                       if text:
-                          output.extend(text_component(text))
+                          result.extend(
+                              text_component(text)
+                          )
+
                       continue
 
                   if not isinstance(child, Tag):
@@ -263,184 +409,242 @@ jobs:
                       "nav",
                       "header",
                       "footer",
-                      "aside",
                       "svg"
                   ):
                       continue
 
-                  if name in ("h1", "h2", "h3", "h4", "h5", "h6"):
-                      text = inline_markdown(child, base_url).strip()
+                  if name in (
+                      "h1",
+                      "h2",
+                      "h3",
+                      "h4",
+                      "h5",
+                      "h6"
+                  ):
+                      text = clean_text(
+                          inline_markdown(
+                              child,
+                              base_url
+                          )
+                      )
 
                       if text:
                           level = int(name[1])
 
                           if level <= 2:
-                              text = "# " + text
+                              prefix = "# "
                           elif level == 3:
-                              text = "## " + text
+                              prefix = "## "
                           else:
-                              text = "### " + text
+                              prefix = "### "
 
-                          output.extend(text_component(text))
-                          output.append(separator())
+                          result.extend(
+                              text_component(
+                                  prefix + text
+                              )
+                          )
 
                       continue
 
-                  if name == "p":
-                      images = []
-
-                      for img in child.find_all("img"):
-                          src = (
-                              img.get("src")
-                              or img.get("data-src")
-                              or img.get("data-lazy-src")
-                          )
-
-                          if not src and img.get("srcset"):
-                              src = img.get("srcset").split(",")[0].strip().split(" ")[0]
-
-                          if src:
-                              images.append(absolute_url(base_url, src))
+                  if name in (
+                      "p",
+                      "div"
+                  ):
+                      images = image_urls_from(
+                          child,
+                          base_url
+                      )
 
                       if images:
-                          media = media_component(images)
-                          if media:
-                              output.append(media)
+                          result.extend(
+                              media_components(
+                                  images
+                              )
+                          )
 
-                      text = inline_markdown(child, base_url)
-                      text = re.sub(r"[ \t]+", " ", text)
-                      text = re.sub(r"\n{3,}", "\n\n", text).strip()
+                      text = inline_markdown(
+                          child,
+                          base_url
+                      )
+
+                      text = clean_text(text)
 
                       if text:
-                          output.extend(text_component(text))
+                          result.extend(
+                              text_component(text)
+                          )
 
                       continue
 
                   if name in ("ul", "ol"):
-                      text = render_list(child, base_url)
+                      text = render_list(
+                          child,
+                          base_url
+                      )
 
                       if text:
-                          output.extend(text_component(text))
+                          result.extend(
+                              text_component(text)
+                          )
 
                       continue
 
                   if name == "blockquote":
-                      text = inline_markdown(child, base_url).strip()
+                      text = clean_text(
+                          inline_markdown(
+                              child,
+                              base_url
+                          )
+                      )
 
                       if text:
-                          lines = text.splitlines()
                           text = "\n".join(
-                              "> " + line.strip()
-                              for line in lines
+                              "> " + line
+                              for line in text.splitlines()
                               if line.strip()
                           )
-                          output.extend(text_component(text))
+
+                          result.extend(
+                              text_component(text)
+                          )
 
                       continue
 
                   if name == "pre":
-                      code = child.get_text("\n", strip=False).strip()
+                      code = child.get_text(
+                          "\n",
+                          strip=False
+                      ).strip()
 
                       if code:
                           language = ""
 
-                          code_node = child.find("code")
+                          code_node = child.find(
+                              "code"
+                          )
 
                           if code_node:
-                              classes = code_node.get("class", [])
-
-                              for cls in classes:
-                                  if cls.startswith("language-"):
-                                      language = cls[9:]
+                              for cls in code_node.get(
+                                  "class",
+                                  []
+                              ):
+                                  if cls.startswith(
+                                      "language-"
+                                  ):
+                                      language = cls[
+                                          9:
+                                      ]
                                       break
 
-                          fenced = "```{}\n{}\n```".format(
-                              language,
-                              code
+                          result.extend(
+                              text_component(
+                                  "```{}\n{}\n```".format(
+                                      language,
+                                      code
+                                  )
+                              )
                           )
-
-                          output.extend(text_component(fenced))
-
-                      continue
-
-                  if name == "hr":
-                      output.append(separator())
-                      continue
-
-                  if name == "img":
-                      src = (
-                          child.get("src")
-                          or child.get("data-src")
-                          or child.get("data-lazy-src")
-                      )
-
-                      if not src and child.get("srcset"):
-                          src = child.get("srcset").split(",")[0].strip().split(" ")[0]
-
-                      if src:
-                          media = media_component(
-                              [absolute_url(base_url, src)]
-                          )
-
-                          if media:
-                              output.append(media)
 
                       continue
 
                   if name == "figure":
-                      images = []
-
-                      for img in child.find_all("img"):
-                          src = (
-                              img.get("src")
-                              or img.get("data-src")
-                              or img.get("data-lazy-src")
-                          )
-
-                          if not src and img.get("srcset"):
-                              src = img.get("srcset").split(",")[0].strip().split(" ")[0]
-
-                          if src:
-                              images.append(absolute_url(base_url, src))
+                      images = image_urls_from(
+                          child,
+                          base_url
+                      )
 
                       if images:
-                          media = media_component(images)
+                          result.extend(
+                              media_components(
+                                  images
+                              )
+                          )
 
-                          if media:
-                              output.append(media)
-
-                      caption = child.find("figcaption")
+                      caption = child.find(
+                          "figcaption"
+                      )
 
                       if caption:
-                          text = inline_markdown(caption, base_url).strip()
+                          caption_text = clean_text(
+                              inline_markdown(
+                                  caption,
+                                  base_url
+                              )
+                          )
 
-                          if text:
-                              output.extend(text_component("*{}*".format(text)))
+                          if caption_text:
+                              result.extend(
+                                  text_component(
+                                      "*{}*".format(
+                                          caption_text
+                                      )
+                                  )
+                              )
 
+                      continue
+
+                  if name == "img":
+                      images = image_urls_from(
+                          child,
+                          base_url
+                      )
+
+                      if images:
+                          result.extend(
+                              media_components(
+                                  images
+                              )
+                          )
+
+                      continue
+
+                  if name == "hr":
+                      result.append(
+                          separator()
+                      )
                       continue
 
                   if name == "table":
                       rows = []
 
-                      for tr in child.find_all("tr"):
+                      for tr in child.find_all(
+                          "tr"
+                      ):
                           cells = []
 
-                          for cell in tr.find_all(["th", "td"], recursive=False):
-                              value = inline_markdown(
-                                  cell,
-                                  base_url
-                              ).strip()
+                          for cell in tr.find_all(
+                              ["th", "td"],
+                              recursive=False
+                          ):
+                              value = clean_text(
+                                  inline_markdown(
+                                      cell,
+                                      base_url
+                                  )
+                              )
 
-                              value = value.replace("|", "\\|")
+                              value = value.replace(
+                                  "|",
+                                  "\\|"
+                              )
+
                               cells.append(value)
 
                           if cells:
-                              rows.append("| " + " | ".join(cells) + " |")
+                              rows.append(
+                                  "| "
+                                  + " | ".join(cells)
+                                  + " |"
+                              )
 
                       if rows:
                           if len(rows) >= 2:
+                              first_row = child.find(
+                                  "tr"
+                              )
+
                               count = len(
-                                  child.find("tr").find_all(
+                                  first_row.find_all(
                                       ["th", "td"],
                                       recursive=False
                                   )
@@ -448,206 +652,35 @@ jobs:
 
                               rows.insert(
                                   1,
-                                  "| " + " | ".join(
+                                  "| "
+                                  + " | ".join(
                                       ["---"] * count
-                                  ) + " |"
+                                  )
+                                  + " |"
                               )
 
-                          output.extend(
-                              text_component("\n".join(rows))
+                          result.extend(
+                              text_component(
+                                  "\n".join(rows)
+                              )
                           )
 
                       continue
 
                   if name in (
-                      "div",
                       "section",
                       "article",
-                      "main",
-                      "details",
-                      "summary"
+                      "main"
                   ):
-                      output.extend(
-                          render_blocks(child, base_url)
-                      )
-                      continue
-
-                  text = inline_markdown(child, base_url)
-                  text = re.sub(r"\s+", " ", text).strip()
-
-                  if text:
-                      output.extend(text_component(text))
-
-              return compact_components(output)
-
-          def compact_components(components):
-              result = []
-
-              for component in components:
-                  if not component:
-                      continue
-
-                  if component.get("type") == 10:
-                      content = component.get("content", "").strip()
-
-                      if not content:
-                          continue
-
-                      if result and result[-1].get("type") == 10:
-                          previous = result[-1].get("content", "")
-
-                          if len(previous) + len(content) + 2 <= MAX_TEXT:
-                              result[-1]["content"] = (
-                                  previous + "\n\n" + content
-                              )
-                              continue
-
-                      component["content"] = content
-
-                  result.append(component)
-
-              return result
-
-          def article_root(soup):
-              root = soup.find("article")
-
-              if root:
-                  return root
-
-              root = soup.find("main")
-
-              if root:
-                  return root
-
-              return soup.body or soup
-
-          def get_meta(soup, key):
-              tag = soup.find(
-                  "meta",
-                  attrs={"property": key}
-              )
-
-              if not tag:
-                  tag = soup.find(
-                      "meta",
-                      attrs={"name": key}
-                  )
-
-              if not tag:
-                  return ""
-
-              return (
-                  tag.get("content", "")
-                  or ""
-              ).strip()
-
-          def get_article(url):
-              html = fetch(url)
-              soup = BeautifulSoup(html, "html.parser")
-
-              for tag in soup.find_all(
-                  ["script", "style", "noscript", "nav", "header", "footer"]
-              ):
-                  tag.decompose()
-
-              title = get_meta(soup, "og:title")
-
-              if not title:
-                  h1 = soup.find("h1")
-
-                  if h1:
-                      title = clean_text(h1.get_text(" ", strip=True))
-
-              if not title:
-                  title = "Discord Update"
-
-              published = get_meta(
-                  soup,
-                  "article:published_time"
-              )
-
-              if not published:
-                  published = get_meta(
-                      soup,
-                      "date"
-                  )
-
-              if published:
-                  match = re.search(
-                      r"\d{4}-\d{2}-\d{2}",
-                      published
-                  )
-
-                  if match:
-                      published = match.group(0)
-
-              root = article_root(soup)
-
-              components = render_blocks(
-                  root,
-                  url
-              )
-
-              og_image = get_meta(
-                  soup,
-                  "og:image"
-              )
-
-              if og_image:
-                  og_image = absolute_url(
-                      url,
-                      og_image
-                  )
-
-              if og_image:
-                  first_media = next(
-                      (
-                          c for c in components
-                          if c.get("type") == 12
-                      ),
-                      None
-                  )
-
-                  if not first_media:
-                      components.insert(
-                          0,
-                          media_component([og_image])
+                      result.extend(
+                          render_blocks(
+                              child,
+                              base_url
+                          )
                       )
 
-              if not components:
-                  text = root.get_text(
-                      "\n",
-                      strip=True
-                  )
+                      continue
 
-                  if text:
-                      components = text_component(text)
-
-              title_text = "# " + title
-
-              has_title = any(
-                  c.get("type") == 10
-                  and c.get("content", "").strip() == title_text
-                  for c in components
-              )
-
-              if not has_title:
-                  components.insert(
-                      0,
-                      {
-                          "type": 10,
-                          "content": title_text
-                      }
-                  )
-
-              if published:
-                  components.insert(
-                      1,
-                      {
-                          "type": 10,
-                          "content": "**Published:** " + published
-                      }
-                  )
-
-              return {
- 
+                  text = clean_text(
+                      inline_markdown(
+       
