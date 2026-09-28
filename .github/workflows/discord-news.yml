@@ -30,8 +30,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .discord-news-state.json
-          key: discord-news-state-v1-${{ github.run_id }}
+          key: discord-news-state-v1-${{ hashFiles('.discord-news-state.json') }}
           restore-keys: discord-news-state-v1-
+
+      - name: Initialize state file
+        run: |
+          if [ ! -f .discord-news-state.json ]; then
+            echo "{}" > .discord-news-state.json
+          fi
 
       - name: Build and run updater
         env:
@@ -43,7 +49,7 @@ jobs:
           WEBHOOK_SOCIAL_SDK: ${{ secrets.WEBHOOK_SOCIAL_SDK }}
           WEBHOOK_BREAKING: ${{ secrets.WEBHOOK_BREAKING }}
         run: |
-          cat > discord_news.py <<'EOFPYTHON'
+          cat > discord_news.py << 'EOFPYTHON'
 import os
 import re
 import json
@@ -381,41 +387,51 @@ def send(webhook, payload):
 
 def main():
     state = load_state()
+    print(f"Loaded state for {len(state)} categories")
     errors = []
     for category, (secret, url, kind, terms) in CONFIG.items():
         try:
-            print(f"=== {category} ===")
+            print(f"\n=== {category.upper()} ===")
             webhook = os.environ.get(secret)
             if not webhook:
                 die(f"{secret} is missing")
+            print(f"Source: {url}")
             current = source(kind, url, category, terms)
             ident = hashlib.sha256(current.encode()).hexdigest()
             if state.get(category) == ident:
-                print("No new update.")
+                print("No new update (state matched)")
                 continue
+            print("New update found, parsing...")
             cs = article(current)
             ms = messages(cs, current)
-            print(f"Source: {current}")
-            print(f"Components: {len(cs)}")
-            print(f"Messages: {len(ms)}")
+            print(f"Generated {len(cs)} components in {len(ms)} message(s)")
             for i, payload in enumerate(ms, 1):
-                print(f"Sending {i}/{len(ms)} ({size(payload)} bytes)")
+                p_size = size(payload)
+                print(f"Sending message {i}/{len(ms)} ({p_size} bytes)")
                 send(webhook, payload)
             state[category] = ident
             save_state(state)
-            print("Sent successfully.")
+            print("✓ Sent successfully")
         except Exception as e:
-            print(f"ERROR [{category}]: {e}")
+            print(f"✗ ERROR: {e}")
             errors.append(f"{category}: {e}")
     if errors:
-        print("=== FAILURES ===")
-        print("\n".join(errors))
+        print(f"\n=== FAILURES ({len(errors)}) ===")
+        for err in errors:
+            print(f"  • {err}")
         raise SystemExit(1)
-    print("All categories completed successfully.")
+    print(f"\n✓ All {len(CONFIG)} categories completed successfully")
 
 if __name__ == "__main__":
     main()
 EOFPYTHON
 
-          python -m py_compile discord_news.py
+          python -m py_compile discord_news.py && echo "✓ Python syntax valid"
           python discord_news.py
+
+      - name: Save state for next run
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .discord-news-state.json
+          key: discord-news-state-v1-${{ hashFiles('.discord-news-state.json') }}
